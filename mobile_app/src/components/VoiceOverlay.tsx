@@ -73,10 +73,12 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
     const [isMuted, setIsMuted] = useState(false);
     const [statusTitle, setStatusTitle] = useState('جاري الاتصال');
     const [statusSubtitle, setStatusSubtitle] = useState('تجهيز الذكاء الاصطناعي...');
-    const [chatHeaderTitle, setChatHeaderTitle] = useState('استمع إليك...');
-    const [chatHeaderSubtitle, setChatHeaderSubtitle] = useState('تحدث بوضوح لطلب وجبتك');
+    const [chatHeaderTitle, setChatHeaderTitle] = useState('مرحباً بك');
+    const [chatHeaderSubtitle, setChatHeaderSubtitle] = useState('كيف يمكنني مساعدتك اليوم؟');
     const [muteToastText, setMuteToastText] = useState('');
     const isMutedRef = useRef(false);
+    const currentMicVolumeRef = useRef(0);
+    const lastVolRef = useRef(0);
     const waveIntervalRef = useRef<any>(null);
     const breathTweenRef = useRef<Animated.CompositeAnimation | null>(null);
     const barAnimRefs = useRef<(Animated.CompositeAnimation | null)[]>([]);
@@ -549,20 +551,32 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
 
     const startVisualizer = () => {
         barsOpacity.setValue(1); micNormalOpacity.setValue(0);
-        // GSAP: visTargetXs = [-36, -18, 0, 18, 36], btn morphs to 170x64 pill
-        const txs = [-36, -18, 0, 18, 36];
+        // Clean layout: absolute bars morphing to [ -32, -16, 0, 16, 32 ]
+        const txs = [-32, -16, 0, 16, 32];
         barXVals.forEach((x, i) => Animated.spring(x, { toValue: txs[i], tension: 50, friction: 7, useNativeDriver: false }).start());
         Animated.parallel([
-            Animated.spring(micBtnWidth, { toValue: 170, tension: 50, friction: 7, useNativeDriver: false }),
-            Animated.spring(micBtnHeight, { toValue: 64, tension: 50, friction: 7, useNativeDriver: false }),
-            Animated.spring(micBtnRadius, { toValue: 32, tension: 50, friction: 7, useNativeDriver: false }),
+            Animated.spring(micBtnWidth, { toValue: 145, tension: 50, friction: 7, useNativeDriver: false }),
+            Animated.spring(micBtnHeight, { toValue: 60, tension: 50, friction: 7, useNativeDriver: false }),
+            Animated.spring(micBtnRadius, { toValue: 30, tension: 50, friction: 7, useNativeDriver: false }),
         ]).start();
-        const baseH = [12, 24, 38, 24, 12];
+        
         const animBar = (i: number) => {
             if (isMutedRef.current) return;
-            const h = 8 + Math.random() * (baseH[i] - 8);
-            Animated.timing(barHeightVals[i], { toValue: h, duration: 200 + Math.random() * 250, easing: Easing.inOut(Easing.sin), useNativeDriver: false })
-                .start(() => animBar(i));
+            // Aggressively expanded visualizer height constraints -> Center max reaches 52px out of 60px capsule
+            const ranges = [ [10, 20], [12, 38], [14, 52], [12, 38], [10, 20] ];
+            const [minH, maxH] = ranges[i];
+            
+            const vol = currentMicVolumeRef.current;
+            
+            const intensity = Math.min(1, Math.max(0, vol));
+            const target = minH + (maxH - minH) * intensity;
+            
+            Animated.timing(barHeightVals[i], { 
+                toValue: target, 
+                duration: 90, 
+                easing: Easing.linear, 
+                useNativeDriver: false 
+            }).start(() => animBar(i));
         };
         barHeightVals.forEach((_, i) => animBar(i));
     };
@@ -1192,8 +1206,43 @@ ${menuText}
             LiveAudioStream.init(options);
 
             LiveAudioStream.on('data', (data) => {
-                // Mute mic while AI audio is playing or user muted
-                if (isSpeaking.current || isMutedRef.current) return;
+                // If the AI is speaking, or user muted, instantly flatline the visualizer to 0
+                // and completely abort sending data back to the websocket.
+                if (isSpeaking.current || isMutedRef.current) {
+                    currentMicVolumeRef.current = 0; // Pure silence flat-line
+                    return;
+                }
+
+                // AI is quiet: Actively track genuine user microphone phonetics.
+                try {
+                    const buf = Buffer.from(data, 'base64');
+                    let maxPeak = 0;
+                    
+                    // True Peak Tracking (Captures fast human syllables and 'T', 'P' plosives perfectly)
+                    for (let i = 0; i < buf.length - 1; i += 2) { 
+                        const val = Math.abs(buf.readInt16LE(i));
+                        if (val > maxPeak) maxPeak = val;
+                    }
+                    
+                    // --- ULTRA SENSITIVE UX CURVE ---
+                    // 1. Strict Peak Noise Gate: Ignores static room noise entirely (typical peak < 200).
+                    let effectiveAmp = Math.max(0, maxPeak - 200); 
+                    
+                    // 2. High-Sensitivity Ceiling. (1500 peak means normal talking will hit 100% easily).
+                    let rawNorm = Math.min(effectiveAmp, 1500) / 1500;
+                    
+                    // 3. Logarithmic Hearing Curve: Boosts whispers physically.
+                    let normRaw = Math.pow(rawNorm, 0.6);
+                    
+                    // 4. Rhythm Bouncing: 80% attack for instant tracking, 50% decay for fast drops.
+                    let last = currentMicVolumeRef.current;
+                    let v = normRaw > last ? (last * 0.2 + normRaw * 0.8) : (last * 0.5 + normRaw * 0.5);
+                    
+                    currentMicVolumeRef.current = v;
+                } catch (e) {
+                    console.warn("Volume calc err:", e);
+                }
+
                 if (ws.current && ws.current.readyState === WebSocket.OPEN) {
                     ws.current.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: data }));
                 }
@@ -1281,9 +1330,9 @@ ${menuText}
     const { width: SW, height: SH } = Dimensions.get('window');
     const ORB_SIZE = 140;
     const categoryLabels = [
-        { icon: '📦', text: 'طلب وجبة جديدة' },
-        { icon: '📄', text: 'إعادة الطلب السابق' },
-        { icon: 'ℹ️', text: 'تتبع حالة الطلب' },
+        { iconName: 'mic-outline', text: 'طلب وجبة جديدة', disabled: false, color: '#000' },
+        { iconName: 'reload-outline', text: 'إعادة الطلب السابق (قريباً)', disabled: true, color: '#7a7a7a' },
+        { iconName: 'time-outline', text: 'تتبع حالة الطلب (قريباً)', disabled: true, color: '#7a7a7a' },
     ];
 
     return (
@@ -1320,17 +1369,7 @@ ${menuText}
 
                 {/* Orb Container */}
                 <Animated.View style={[s.orbContainer, { transform: [{ translateY: orbTransY }] }]}>
-                    {/* Blob Glow */}
-                    <Animated.View style={[s.blobGlow, { opacity: glowOpacity, transform: [{ scale: glowScale }] }]} />
-                    {/* Core Blob */}
-                    <Animated.View style={[s.coreBlob, { opacity: blobOpacity, transform: [{ scale: blobScale }, { translateY: blobTransY }] }]} />
-                    {/* Loading Dots */}
-                    {dotScales.map((sc, i) => (
-                        <Animated.View key={`dot-${i}`} style={[s.loadDot, {
-                            opacity: sc, transform: [{ translateX: dotXs[i] }, { translateY: dotYs[i] }, { scale: sc }, { scaleX: dotScaleXs[i] }, { scaleY: dotScaleYs[i] }],
-                        }]} />
-                    ))}
-                    {/* Drop Blobs + Category Buttons */}
+                    {/* Drop Blobs + Category Buttons (Rendered First = Behind) */}
                     {dropScales.map((sc, i) => (
                         <Animated.View key={`drop-${i}`} style={{
                             position: 'absolute',
@@ -1343,20 +1382,33 @@ ${menuText}
                                 width: dropWidths[i],
                                 height: dropHeights[i],
                                 borderRadius: 999,
-                                backgroundColor: '#000',
+                                backgroundColor: categoryLabels[i].color,
                                 alignItems: 'center',
                                 justifyContent: 'center',
                                 overflow: 'hidden'
                             }}>
-                                <TouchableOpacity onPress={() => enterChatMode(i)} activeOpacity={0.8}
+                                <TouchableOpacity onPress={() => !categoryLabels[i].disabled && enterChatMode(i)} activeOpacity={categoryLabels[i].disabled ? 1 : 0.8}
                                     style={s.dropTouchable}>
                                     <Animated.View style={[s.labelRow, { opacity: labelOpacities[i], transform: [{ scale: labelScales[i] }] }]}>
-                                        <Text style={s.labelIcon}>{categoryLabels[i].icon}</Text>
                                         <Text style={s.labelText}>{categoryLabels[i].text}</Text>
+                                        <Ionicons name={categoryLabels[i].iconName as any} size={22} color="#fff" style={{marginLeft: 8}} />
                                     </Animated.View>
                                 </TouchableOpacity>
                             </Animated.View>
                         </Animated.View>
+                    ))}
+
+                    {/* Blob Glow */}
+                    <Animated.View style={[s.blobGlow, { opacity: glowOpacity, transform: [{ scale: glowScale }] }]} />
+                    
+                    {/* Core Blob (Rendered Last = On Top) */}
+                    <Animated.View style={[s.coreBlob, { opacity: blobOpacity, transform: [{ scale: blobScale }, { translateY: blobTransY }] }]} />
+                    
+                    {/* Loading Dots */}
+                    {dotScales.map((sc, i) => (
+                        <Animated.View key={`dot-${i}`} style={[s.loadDot, {
+                            opacity: sc, transform: [{ translateX: dotXs[i] }, { translateY: dotYs[i] }, { scale: sc }, { scaleX: dotScaleXs[i] }, { scaleY: dotScaleYs[i] }],
+                        }]} />
                     ))}
                 </Animated.View>
 
@@ -1441,6 +1493,7 @@ ${menuText}
                 {appPhase === 'chat' && cartItems.length > 0 && showFullCart && (
                     <OrderCartWidget items={cartItems} restaurantName={selectedRestaurantRef.current?.name_ar}
                         onItemsChange={(ni) => setCartItems(ni)}
+                        onClose={() => setShowFullCart(false)}
                         onConfirm={() => {
                             const subtotal = cartItems.reduce((sum, i) => sum + (i.unit_price * i.quantity), 0);
                             const total = (subtotal * 1.15).toFixed(2);
@@ -1472,9 +1525,9 @@ ${menuText}
 const s = StyleSheet.create({
     root: { flex: 1, backgroundColor: '#ffffff' },
     backBtn: { position: 'absolute', top: 54, left: 16, zIndex: 20, width: 44, height: 44, borderRadius: 22, backgroundColor: 'rgba(0,0,0,0.06)', alignItems: 'center', justifyContent: 'center' },
-    statusContainer: { position: 'absolute', top: '10%', width: '100%', alignItems: 'center', zIndex: 5 },
-    statusTitle: { fontSize: 26, fontWeight: '700', color: '#000', letterSpacing: -0.5 },
-    statusSub: { fontSize: 15, color: '#8e8e93', marginTop: 8, fontWeight: '500' },
+    statusContainer: { position: 'absolute', top: '10%', left: 0, right: 0, width: '100%', alignItems: 'center', zIndex: 5, paddingHorizontal: 20 },
+    statusTitle: { fontSize: 26, fontWeight: '700', color: '#000', textAlign: 'center', includeFontPadding: false },
+    statusSub: { fontSize: 15, color: '#8e8e93', marginTop: 8, fontWeight: '500', textAlign: 'center' },
     orbContainer: { position: 'absolute', top: '26%', alignSelf: 'center', width: 140, height: 140, alignItems: 'center', justifyContent: 'center', zIndex: 10 },
     blobGlow: { position: 'absolute', width: 200, height: 200, borderRadius: 100 },
     coreBlob: { position: 'absolute', width: 140, height: 140, borderRadius: 70, backgroundColor: '#000' },
@@ -1489,14 +1542,14 @@ const s = StyleSheet.create({
     aiBubble: { alignSelf: 'flex-start', marginBottom: 10, maxWidth: '78%', paddingHorizontal: 4, paddingVertical: 6 },
     userText: { fontSize: 16, color: '#111', textAlign: 'right', lineHeight: 24 },
     aiText: { fontSize: 16, color: '#333', lineHeight: 24, textAlign: 'right' },
-    muteToast: { position: 'absolute', bottom: 140, alignSelf: 'center', backgroundColor: 'rgba(0,0,0,0.75)', borderRadius: 22, paddingHorizontal: 18, paddingVertical: 10, flexDirection: 'row', alignItems: 'center', gap: 8, zIndex: 30 },
+    muteToast: { position: 'absolute', bottom: 150, alignSelf: 'center', backgroundColor: 'rgba(0,0,0,0.75)', borderRadius: 22, paddingHorizontal: 18, paddingVertical: 10, flexDirection: 'row', alignItems: 'center', gap: 8, zIndex: 30 },
     toastText: { fontSize: 14, color: '#fff', fontWeight: '500' },
-    bottomBar: { position: 'absolute', bottom: 45, width: '100%', flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 20, zIndex: 15 },
+    bottomBar: { position: 'absolute', bottom: 65, width: '100%', flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 20, zIndex: 15 },
     endBtn: { width: 52, height: 52, borderRadius: 26, backgroundColor: '#ff3b30', alignItems: 'center', justifyContent: 'center' },
     micBtn: { backgroundColor: '#000', alignItems: 'center', justifyContent: 'center', overflow: 'hidden' },
     micIconWrap: { position: 'absolute', alignItems: 'center', justifyContent: 'center' },
-    barsWrap: { position: 'absolute', flexDirection: 'row', alignItems: 'center', justifyContent: 'center' },
-    visBar: { width: 10, backgroundColor: '#fff', borderRadius: 5, marginHorizontal: 2 },
+    barsWrap: { position: 'absolute', alignItems: 'center', justifyContent: 'center' },
+    visBar: { position: 'absolute', width: 10, backgroundColor: '#fff', borderRadius: 5 },
     cartBtn: { width: 52, height: 52, borderRadius: 26, backgroundColor: '#ffffff', alignItems: 'center', justifyContent: 'center', shadowColor: '#000', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.08, shadowRadius: 12, elevation: 4 },
     badge: { position: 'absolute', top: -4, right: -4, backgroundColor: '#111', borderRadius: 11, minWidth: 22, height: 22, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 6, borderWidth: 2, borderColor: '#f5f5f5' },
     badgeText: { fontSize: 12, fontWeight: '700', color: '#fff' },
