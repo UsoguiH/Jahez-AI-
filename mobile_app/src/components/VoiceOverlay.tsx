@@ -45,6 +45,7 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
     const [orderDetails, setOrderDetails] = useState<{ summary: string; total: number } | null>(null);
     const [showFullCart, setShowFullCart] = useState(false);
     const [suggestedRestaurants, setSuggestedRestaurants] = useState<{name_ar: string; name_en: string; id: string}[]>([]);
+    const [activeRestaurantUI, setActiveRestaurantUI] = useState<Restaurant | null>(null);
     const scrollViewRef = useRef<ScrollView>(null);
     const ws = useRef<WebSocket | null>(null);
     const recording = useRef<Audio.Recording | null>(null);
@@ -129,6 +130,7 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
     const backdropOpacity = useRef(new Animated.Value(0)).current;
     const toastOpacity = useRef(new Animated.Value(0)).current;
     const toastTransY = useRef(new Animated.Value(8)).current;
+    const selectedRestAnimScale = useRef(new Animated.Value(0)).current;
 
     const SUPABASE_PROJECT_ID = 'vnqtonsbvnaxtoldvycy';
 
@@ -542,7 +544,10 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
         setTimeout(() => {
             setIsListening(false); stopRecording();
             if (ws.current) { ws.current.close(); ws.current = null; }
-            setIsConnected(false); selectedRestaurantRef.current = null;
+            setIsConnected(false); 
+            selectedRestaurantRef.current = null;
+            setActiveRestaurantUI(null);
+            selectedRestAnimScale.setValue(0);
             setCartItems([]); setOrderConfirmed(false); setOrderDetails(null);
             setShowFullCart(false); setSuggestedRestaurants([]); setMessages([]); setCurrentAiText('');
             runConnectingSequence();
@@ -1058,7 +1063,17 @@ ${menuText}
         }
 
         selectedRestaurantRef.current = restaurant;
+        setActiveRestaurantUI(restaurant);
         setSuggestedRestaurants([]);
+
+        // Elegant spring entrance for the newly selected restaurant logo
+        selectedRestAnimScale.setValue(0);
+        Animated.spring(selectedRestAnimScale, {
+            toValue: 1,
+            tension: 50,
+            friction: 6,
+            useNativeDriver: true
+        }).start();
 
         // Inject the full menu into the AI's instructions via session.update
         const updatedInstructions = getMenuInstructions(restaurant);
@@ -1354,6 +1369,37 @@ ${menuText}
                         <Ionicons name="chevron-back" size={28} color="#000" />
                     </TouchableOpacity>
                 </Animated.View>
+
+                {/* Selected Restaurant Logo Orb (Top Right) */}
+                {activeRestaurantUI && getRestaurantLogo(activeRestaurantUI.name_ar) ? (
+                    <Animated.View style={{
+                        position: 'absolute',
+                        top: 54,
+                        right: 16,
+                        zIndex: 20,
+                        width: 44,
+                        height: 44,
+                        borderRadius: 22,
+                        backgroundColor: '#fff',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        shadowColor: '#000',
+                        shadowOffset: { width: 0, height: 2 },
+                        shadowOpacity: 0.1,
+                        shadowRadius: 6,
+                        elevation: 5,
+                        transform: [{ scale: selectedRestAnimScale }],
+                        opacity: selectedRestAnimScale,
+                        borderWidth: 1,
+                        borderColor: '#E5E5EA'
+                    }}>
+                        <Image 
+                            source={getRestaurantLogo(activeRestaurantUI.name_ar)} 
+                            style={{ width: 32, height: 32, borderRadius: 16 }} 
+                            resizeMode="contain" 
+                        />
+                    </Animated.View>
+                ) : null}
 
                 {/* Status Text (connecting + menu phases) */}
                 <Animated.View style={[s.statusContainer, { opacity: statusOpacity, transform: [{ translateY: statusTransY }] }]}>
