@@ -9,6 +9,7 @@ import { Buffer } from 'buffer';
 import { supabase } from '../lib/supabase';
 import { Ionicons, MaterialIcons } from '@expo/vector-icons';
 import OrderCartWidget, { CartItem } from './OrderCartWidget';
+import CheckoutScreen from './CheckoutScreen';
 import InlineCartWidget from './InlineCartWidget';
 import OrderConfirmation from './OrderConfirmation';
 import RestaurantSuggestions, { CUISINE_MAP } from './RestaurantSuggestions';
@@ -49,6 +50,7 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
     const [isAiSpeaking, setIsAiSpeaking] = useState(false);
     const [orderDetails, setOrderDetails] = useState<{ summary: string; total: number } | null>(null);
     const [showFullCart, setShowFullCart] = useState(false);
+    const [showCheckout, setShowCheckout] = useState(false);
     const [suggestedRestaurants, setSuggestedRestaurants] = useState<{name_ar: string; name_en: string; id: string}[]>([]);
     const [activeRestaurantUI, setActiveRestaurantUI] = useState<Restaurant | null>(null);
     const scrollViewRef = useRef<ScrollView>(null);
@@ -1895,19 +1897,8 @@ ${combosCatalogForPrompt()}
                         onItemsChange={(ni) => setCartItems(ni)}
                         onClose={() => setShowFullCart(false)}
                         onConfirm={() => {
-                            const subtotal = cartItems.reduce((sum, i) => sum + (i.unit_price * i.quantity), 0);
-                            const total = (subtotal * 1.15).toFixed(2);
-                            const itemsSummary = cartItems.map(i => `${i.name_ar} × ${i.quantity}`).join('، ');
-                            Alert.alert('تأكيد الطلب ✅', `${itemsSummary}\n\nالمجموع: ${total} ر.س`, [
-                                { text: 'إلغاء', style: 'cancel' },
-                                { text: 'تأكيد', onPress: () => {
-                                    if (ws.current && ws.current.readyState === WebSocket.OPEN) {
-                                        ws.current.send(JSON.stringify({ type: 'conversation.item.create', item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'أكد الطلب' }] } }));
-                                        ws.current.send(JSON.stringify({ type: 'response.create' }));
-                                    }
-                                    setShowFullCart(false);
-                                }},
-                            ]);
+                            setShowFullCart(false);
+                            setShowCheckout(true);
                         }}
                         onEdit={() => {
                             if (ws.current && ws.current.readyState === WebSocket.OPEN) {
@@ -1917,6 +1908,20 @@ ${combosCatalogForPrompt()}
                         }}
                     />
                 )}
+
+                {/* Checkout Screen (اتمام الطلب) */}
+                <CheckoutScreen
+                    visible={showCheckout}
+                    items={cartItems}
+                    onClose={() => setShowCheckout(false)}
+                    onPay={() => {
+                        if (ws.current && ws.current.readyState === WebSocket.OPEN) {
+                            ws.current.send(JSON.stringify({ type: 'conversation.item.create', item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'أكد الطلب' }] } }));
+                            ws.current.send(JSON.stringify({ type: 'response.create' }));
+                        }
+                        setShowCheckout(false);
+                    }}
+                />
             </View>
         </Modal>
     );
