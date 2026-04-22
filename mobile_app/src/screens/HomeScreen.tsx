@@ -1,10 +1,13 @@
 
 import React, { useState } from 'react';
-import { View, Text, ScrollView, TextInput, Image, TouchableOpacity, SafeAreaView, Platform } from 'react-native';
+import { View, Text, ScrollView, TextInput, Image, TouchableOpacity, SafeAreaView, Platform, Alert } from 'react-native';
 import { Ionicons, MaterialIcons, FontAwesome5 } from '@expo/vector-icons';
 import VoiceOverlay from '../components/VoiceOverlay';
 import CartSummary from '../components/CartSummary';
 import ActiveOrderBanner from '../components/ActiveOrderBanner';
+import ComboCard from '../components/ComboCard';
+import { BIG_MAC_MEAL } from '../data/mcdonaldsCombo';
+import { comboStore } from '../state/comboStore';
 
 const HomeScreen = ({ userId }: { userId?: string }) => {
     const [isVoiceOpen, setIsVoiceOpen] = useState(false);
@@ -73,6 +76,30 @@ const HomeScreen = ({ userId }: { userId?: string }) => {
                         <View className="absolute -left-10 -bottom-10 w-40 h-40 bg-white/10 rounded-full" />
                         <View className="absolute left-10 -top-10 w-20 h-20 bg-white/10 rounded-full" />
                     </View>
+                </View>
+
+                {/* FEATURED COMBO — Big Mac Meal (inline card) */}
+                <View className="px-4 mt-5">
+                    <View className="flex-row justify-between items-center mb-3">
+                        <Text className="font-bold text-xl text-gray-800">وجبة اليوم</Text>
+                        <View className="bg-yellow-100 px-2 py-1 rounded-full">
+                            <Text className="text-yellow-800 text-[10px] font-bold">مخصص بالصوت</Text>
+                        </View>
+                    </View>
+                    <ComboCard
+                        combo={BIG_MAC_MEAL}
+                        onVoiceTap={(combo) => {
+                            comboStore.setActive(combo);
+                            setIsVoiceOpen(true);
+                        }}
+                        onAddToCart={(payload) => {
+                            console.log('[COMBO] added:', payload);
+                            Alert.alert(
+                                'تمت الإضافة للسلة ✓',
+                                `${payload.summary_ar}\n\nالمجموع: ${payload.line_total.toFixed(2)} ر.س`
+                            );
+                        }}
+                    />
                 </View>
 
                 {/* Categories */}
@@ -163,6 +190,7 @@ const HomeScreen = ({ userId }: { userId?: string }) => {
                 onClose={() => {
                     console.log('VoiceOverlay onClose called');
                     setIsVoiceOpen(false);
+                    comboStore.clearActive();
                 }}
             />
 

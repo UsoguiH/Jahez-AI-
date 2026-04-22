@@ -13,6 +13,10 @@ import InlineCartWidget from './InlineCartWidget';
 import OrderConfirmation from './OrderConfirmation';
 import RestaurantSuggestions, { CUISINE_MAP } from './RestaurantSuggestions';
 import { getRestaurantLogo } from '../lib/restaurantLogos';
+import { comboStore, useActiveCombo } from '../state/comboStore';
+import { ComboItem } from '../data/mcdonaldsCombo';
+import { findCombo, combosCatalogForPrompt } from '../data/combos';
+import ComboCard from './ComboCard';
 
 // Polyfill for global
 if (!global.btoa) { global.btoa = btoa; }
@@ -33,6 +37,7 @@ interface VoiceOverlayProps {
 }
 
 const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
+    const activeCombo = useActiveCombo();
     const [isListening, setIsListening] = useState(false);
     const [isConnected, setIsConnected] = useState(false);
     const [status, setStatus] = useState('Idle');
@@ -439,86 +444,80 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
     // =====================================================
     const enterChatMode = (idx: number) => {
         setAppPhase('chat');
+        setChatHeaderTitle('استمع إليك...');
+        setChatHeaderSubtitle('تحدث بوضوح لطلب وجبتك');
 
-        // t=0: fade out non-selected pills (GSAP: opacity:0, scale:0.5, dur:0.25)
-        dropOpacities.forEach((op, i) => { if (i !== idx) {
-            Animated.timing(op, { toValue: 0, duration: 250, easing: Easing.in(Easing.quad), useNativeDriver: true }).start();
-            Animated.timing(dropScales[i], { toValue: 0.5, duration: 250, easing: Easing.in(Easing.quad), useNativeDriver: true }).start();
-        }});
+        // Bottom-bar buttons keep scale=1 throughout (no bounce, no jitter). All entry motion
+        // uses the native driver with smooth timing curves — no springs on layout/size.
+        bottomBtnScales.forEach((sc) => sc.setValue(1));
 
-        // t=0.1: hide label of selected (GSAP: opacity:0, scale:0.8, dur:0.2)
-        setTimeout(() => {
-            Animated.timing(labelOpacities[idx], { toValue: 0, duration: 200, easing: Easing.in(Easing.quad), useNativeDriver: true }).start();
-            Animated.timing(labelScales[idx], { toValue: 0.8, duration: 200, useNativeDriver: true }).start();
-        }, 100);
+        const easeOut = Easing.out(Easing.cubic);
+        const easeInOut = Easing.bezier(0.4, 0, 0.2, 1); // Material "standard" curve — polished feel
 
-        // t=0.2: shrink selected back to circle (GSAP: width:60, height:60, dur:0.4, power3.inOut)
-        setTimeout(() => {
-            Animated.timing(dropWidths[idx], { toValue: 60, duration: 400, easing: Easing.inOut(Easing.cubic), useNativeDriver: false }).start();
-            Animated.timing(dropHeights[idx], { toValue: 60, duration: 400, easing: Easing.inOut(Easing.cubic), useNativeDriver: false }).start();
-        }, 200);
+        // --- PHASE 1 (0 → 200ms): non-selected pills fade out, all labels fade (label of selected first)
+        Animated.parallel([
+            ...dropOpacities.map((op, i) =>
+                i === idx ? Animated.delay(0) : Animated.timing(op, { toValue: 0, duration: 220, easing: easeOut, useNativeDriver: true })
+            ),
+            ...dropScales.map((sc, i) =>
+                i === idx ? Animated.delay(0) : Animated.timing(sc, { toValue: 0.3, duration: 220, easing: easeOut, useNativeDriver: true })
+            ),
+            ...labelOpacities.map((op) =>
+                Animated.timing(op, { toValue: 0, duration: 180, easing: easeOut, useNativeDriver: true })
+            ),
+            Animated.timing(statusOpacity, { toValue: 0, duration: 200, easing: easeOut, useNativeDriver: true }),
+        ]).start();
 
-        // t=0.3: blob squash anticipation (GSAP: y:20, scaleY:1.1, scaleX:0.9, dur:0.3)
-        setTimeout(() => {
-            Animated.timing(blobTransY, { toValue: 20, duration: 300, easing: Easing.inOut(Easing.quad), useNativeDriver: true }).start();
-        }, 300);
+        // --- PHASE 2 (140 → 460ms): selected pill MORPHS from capsule (~pillW × 72) to ball (60 × 60)
+        // This is the "cool" part — smooth shape collapse. JS-thread driven (width/height), but isolated
+        // to a single pill; bottom bar (fixed height 80) and orb (native transforms) are unaffected.
+        Animated.parallel([
+            Animated.timing(dropWidths[idx], { toValue: 60, duration: 340, delay: 140, easing: easeInOut, useNativeDriver: false }),
+            Animated.timing(dropHeights[idx], { toValue: 60, duration: 340, delay: 140, easing: easeInOut, useNativeDriver: false }),
+        ]).start();
 
-        // t=0.3: selected pill flies up to blob (GSAP: y:0, dur:0.5, back.in(1.2))
-        setTimeout(() => {
-            Animated.timing(dropYs[idx], { toValue: 0, duration: 500, easing: Easing.in(Easing.back(1.2)), useNativeDriver: true }).start();
-        }, 300);
+        // --- PHASE 3 (440 → 820ms): the ball glides up toward the orb, orb anticipates ---
+        Animated.parallel([
+            // Ball flies up into the orb's position
+            Animated.timing(dropYs[idx], { toValue: 0, duration: 380, delay: 440, easing: easeInOut, useNativeDriver: true }),
+            // Orb does a subtle squish-anticipation
+            Animated.sequence([
+                Animated.delay(440),
+                Animated.timing(blobTransY, { toValue: 6, duration: 180, easing: easeInOut, useNativeDriver: true }),
+                Animated.timing(blobTransY, { toValue: 0, duration: 260, easing: easeOut, useNativeDriver: true }),
+            ]),
+        ]).start();
 
-        // t=0.6: hide status text
-        setTimeout(() => {
-            Animated.timing(statusOpacity, { toValue: 0, duration: 200, useNativeDriver: true }).start();
-        }, 600);
+        // --- PHASE 4 (780 → 1180ms): absorb — ball fades into orb, orb pops, then lifts ---
+        Animated.parallel([
+            // Ball fades in sync with the absorb pop
+            Animated.timing(dropOpacities[idx], { toValue: 0, duration: 180, delay: 780, easing: easeOut, useNativeDriver: true }),
+            Animated.timing(dropScales[idx], { toValue: 0.85, duration: 180, delay: 780, easing: easeOut, useNativeDriver: true }),
+            // Blob pops outward on impact, then eases back to rest
+            Animated.sequence([
+                Animated.delay(780),
+                Animated.timing(blobScale, { toValue: 1.2, duration: 200, easing: easeOut, useNativeDriver: true }),
+                Animated.timing(blobScale, { toValue: 1, duration: 360, easing: easeInOut, useNativeDriver: true }),
+            ]),
+            // Lift the whole orb container up
+            Animated.timing(orbTransY, { toValue: LIFT, duration: 600, delay: 740, easing: easeInOut, useNativeDriver: true }),
+        ]).start();
 
-        // t=0.7: selected pill disappears, blob absorbs with scale pop
-        setTimeout(() => {
-            dropOpacities[idx].setValue(0);
-            // GSAP: scaleX:1.3, scaleY:1.3, y:-10, dur:0.3
-            Animated.parallel([
-                Animated.timing(blobScale, { toValue: 1.3, duration: 300, easing: Easing.out(Easing.quad), useNativeDriver: true }),
-                Animated.timing(blobTransY, { toValue: -10, duration: 300, easing: Easing.out(Easing.quad), useNativeDriver: true }),
-            ]).start();
-        }, 700);
+        // --- PHASE 5 (880 → 1320ms): header, canvas, bottom bar slide in behind the orb motion ---
+        Animated.parallel([
+            Animated.timing(chatHeaderOpacity, { toValue: 1, duration: 360, delay: 920, easing: easeOut, useNativeDriver: true }),
+            Animated.timing(chatHeaderTransY, { toValue: LIFT, duration: 540, delay: 780, easing: easeInOut, useNativeDriver: true }),
+            Animated.timing(chatCanvasOpacity, { toValue: 1, duration: 380, delay: 940, easing: easeOut, useNativeDriver: true }),
+            Animated.timing(chatCanvasTransY, { toValue: 0, duration: 500, delay: 820, easing: easeInOut, useNativeDriver: true }),
+            // Bottom bar — pure opacity + single translateY, no per-button scale
+            Animated.timing(bottomBtnTransY, { toValue: 0, duration: 500, delay: 820, easing: easeInOut, useNativeDriver: true }),
+            ...bottomBtnOpacities.map((op) =>
+                Animated.timing(op, { toValue: 1, duration: 360, delay: 920, easing: easeOut, useNativeDriver: true })
+            ),
+        ]).start();
 
-        // t=0.8: lift entire organism up (GSAP: y:"-10vh", dur:0.8, power3.inOut)
-        setTimeout(() => {
-            Animated.timing(orbTransY, { toValue: LIFT, duration: 800, easing: Easing.inOut(Easing.cubic), useNativeDriver: true }).start();
-        }, 800);
-
-        // t=1.0: blob settles back to normal (GSAP: scaleX:1, scaleY:1, y:0, dur:0.5, power3.out)
-        setTimeout(() => {
-            Animated.parallel([
-                Animated.timing(blobScale, { toValue: 1, duration: 500, easing: Easing.out(Easing.cubic), useNativeDriver: true }),
-                Animated.timing(blobTransY, { toValue: 0, duration: 500, easing: Easing.out(Easing.cubic), useNativeDriver: true }),
-            ]).start();
-        }, 1000);
-
-        // t=1.2: chat header text + chat buttons appear
-        setTimeout(() => {
-            setChatHeaderTitle('استمع إليك...'); setChatHeaderSubtitle('تحدث بوضوح لطلب وجبتك');
-            Animated.parallel([
-                Animated.timing(chatHeaderOpacity, { toValue: 1, duration: 500, useNativeDriver: true }),
-                Animated.timing(chatHeaderTransY, { toValue: LIFT, duration: 500, useNativeDriver: true }),
-            ]).start();
-            // GSAP: fromTo chatButtons {y:30, opacity:0, scale:0.7} → {y:0, opacity:1, scale:1, dur:0.6, stagger:0.08, back.out(1.5)}
-            bottomBtnOpacities.forEach((op, i) => setTimeout(() => {
-                Animated.spring(op, { toValue: 1, tension: 80, friction: 10, useNativeDriver: true }).start();
-                Animated.spring(bottomBtnScales[i], { toValue: 1, tension: 80, friction: 10, useNativeDriver: true }).start();
-            }, i * 80));
-            Animated.spring(bottomBtnTransY, { toValue: 0, tension: 50, friction: 8, useNativeDriver: true }).start();
-        }, 1200);
-
-        // t=1.3: show chat canvas
-        setTimeout(() => Animated.parallel([
-            Animated.timing(chatCanvasOpacity, { toValue: 1, duration: 500, useNativeDriver: true }),
-            Animated.timing(chatCanvasTransY, { toValue: 0, duration: 500, useNativeDriver: true }),
-        ]).start(), 1300);
-
-        // t=1.6: auto-connect voice
-        setTimeout(() => handleMicPress(), 1600);
+        // Auto-connect voice once the full motion has settled
+        setTimeout(() => handleMicPress(), 1360);
     };
 
     const handleEndSession = () => {
@@ -558,11 +557,11 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
         barsOpacity.setValue(1); micNormalOpacity.setValue(0);
         // Clean layout: absolute bars morphing to [ -32, -16, 0, 16, 32 ]
         const txs = [-32, -16, 0, 16, 32];
-        barXVals.forEach((x, i) => Animated.spring(x, { toValue: txs[i], tension: 50, friction: 7, useNativeDriver: false }).start());
+        barXVals.forEach((x, i) => Animated.timing(x, { toValue: txs[i], duration: 260, easing: Easing.out(Easing.cubic), useNativeDriver: false }).start());
         Animated.parallel([
-            Animated.spring(micBtnWidth, { toValue: 145, tension: 50, friction: 7, useNativeDriver: false }),
-            Animated.spring(micBtnHeight, { toValue: 60, tension: 50, friction: 7, useNativeDriver: false }),
-            Animated.spring(micBtnRadius, { toValue: 30, tension: 50, friction: 7, useNativeDriver: false }),
+            Animated.timing(micBtnWidth, { toValue: 145, duration: 260, easing: Easing.out(Easing.cubic), useNativeDriver: false }),
+            Animated.timing(micBtnHeight, { toValue: 60, duration: 260, easing: Easing.out(Easing.cubic), useNativeDriver: false }),
+            Animated.timing(micBtnRadius, { toValue: 30, duration: 260, easing: Easing.out(Easing.cubic), useNativeDriver: false }),
         ]).start();
         
         const animBar = (i: number) => {
@@ -591,9 +590,9 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
         barHeightVals.forEach(h => Animated.timing(h, { toValue: 10, duration: 200, useNativeDriver: false }).start());
         barXVals.forEach(x => Animated.timing(x, { toValue: 0, duration: 300, useNativeDriver: false }).start());
         Animated.parallel([
-            Animated.spring(micBtnWidth, { toValue: 76, tension: 50, friction: 7, useNativeDriver: false }),
-            Animated.spring(micBtnHeight, { toValue: 76, tension: 50, friction: 7, useNativeDriver: false }),
-            Animated.spring(micBtnRadius, { toValue: 38, tension: 50, friction: 7, useNativeDriver: false }),
+            Animated.timing(micBtnWidth, { toValue: 76, duration: 260, easing: Easing.out(Easing.cubic), useNativeDriver: false }),
+            Animated.timing(micBtnHeight, { toValue: 76, duration: 260, easing: Easing.out(Easing.cubic), useNativeDriver: false }),
+            Animated.timing(micBtnRadius, { toValue: 38, duration: 260, easing: Easing.out(Easing.cubic), useNativeDriver: false }),
         ]).start();
         setTimeout(() => { barsOpacity.setValue(0); micNormalOpacity.setValue(1); }, 400);
     };
@@ -606,9 +605,9 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
             barXVals.forEach(x => Animated.timing(x, { toValue: 0, duration: 280, useNativeDriver: false }).start());
             Animated.parallel([
                 Animated.timing(barsOpacity, { toValue: 0, duration: 180, useNativeDriver: true }),
-                Animated.spring(micBtnWidth, { toValue: 76, tension: 50, friction: 7, useNativeDriver: false }),
-                Animated.spring(micBtnHeight, { toValue: 76, tension: 50, friction: 7, useNativeDriver: false }),
-                Animated.spring(micBtnRadius, { toValue: 38, tension: 50, friction: 7, useNativeDriver: false }),
+                Animated.timing(micBtnWidth, { toValue: 76, duration: 240, easing: Easing.out(Easing.cubic), useNativeDriver: false }),
+                Animated.timing(micBtnHeight, { toValue: 76, duration: 240, easing: Easing.out(Easing.cubic), useNativeDriver: false }),
+                Animated.timing(micBtnRadius, { toValue: 38, duration: 240, easing: Easing.out(Easing.cubic), useNativeDriver: false }),
             ]).start();
             micNormalOpacity.setValue(0);
             Animated.timing(micMutedOpacity, { toValue: 1, duration: 240, useNativeDriver: true }).start();
@@ -674,18 +673,77 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
 - لم يتم اختيار مطعم بعد.
 - User ID = '${userId || 'guest-user-123'}'.
 
+**الوجبات (Combos) المتاحة للتخصيص بالصوت:**
+${combosCatalogForPrompt()}
+
 **المهام:**
 1. عند أول اتصال، رحّب بالمستخدم ترحيب حار وقصير واسأله "وش تشتهي اليوم؟" واذكر الأنواع: برقر، دجاج، شاورما، بيتزا، أو قهوة. لا تذكر أسماء المطاعم كلها.
 2. **مهم جداً:** لما المستخدم يقول نوع أكل (مثل "برقر" أو "دجاج" أو "بيتزا")، استخدم أداة suggest_restaurants فوراً مع نوع الأكل. هذا يعرض بطاقات المطاعم على شاشة المستخدم وهو يقدر يختار بالضغط أو بالصوت.
 3. لما المستخدم يقول اسم مطعم مباشرة، استخدم أداة select_restaurant فوراً بدون ما تسأل عن النوع.
-4. بعد ما يتم تحميل القائمة، ساعد المستخدم في الطلب.
-5. لا تحاول تعرض قائمة طعام قبل استخدام select_restaurant.
+4. **مهم جداً — قاعدة open_combo_customizer:** استخدم open_combo_customizer **فقط** إذا كان الصنف موجود حرفياً بالـ combo_id في قسم "الوجبات (Combos) المتاحة للتخصيص بالصوت" أعلاه (مثل "mcd_big_mac_meal"). **لا تستخدمها لأي صنف عادي من قائمة المطعم حتى لو كان في قسم اسمه "وجبات" أو يحتوي كلمة "وجبة".** أي صنف غير مدرج بالاسم والـ id في قائمة الـ Combos أعلاه → استخدم update_cart. مثال: "٩ قطع ماك ناجتس" أو "تسع قطع ناجتس" → update_cart (ليس open_combo_customizer).
+5. بعد فتح بطاقة التخصيص، اسأل المستخدم عن الحجم (أول مجموعة مطلوبة) واستخدم customize_combo مع كل اختيار يقوله.
+6. لما يؤكد الوجبة، استخدم add_active_combo_to_cart.
+7. بعد ما يتم تحميل القائمة (للأصناف العادية غير الوجبات)، ساعد المستخدم في الطلب.
+8. لا تحاول تعرض قائمة طعام قبل استخدام select_restaurant.
 
 **تعليمات مهمة:**
 - لا تذكر أي IDs أو معلومات تقنية.
 - الأسعار بالريال السعودي.
 - ردودك قصيرة جداً — جملة أو جملتين فقط.
 - لا تسرد جميع المطاعم أبداً. فقط اقترح ٢-٣ مطاعم حسب ما يشتهيه المستخدم.`;
+    };
+
+    // Build combo-mode instructions (when user opens voice from a ComboCard)
+    const getComboInstructions = (combo: ComboItem) => {
+        const groupsText = combo.groups
+            .map((g) => {
+                const opts = g.options
+                    .map(
+                        (o) =>
+                            `    • ${o.name_ar} (id: ${o.id})${o.price_delta > 0 ? ` +${o.price_delta} ر.س` : ''}`
+                    )
+                    .join('\n');
+                return `  🔸 ${g.title_ar} (group_id: ${g.id}) — ${g.required ? 'مطلوب' : 'اختياري'} — ${g.select === 'single' ? 'اختر واحد فقط' : 'تقدر تختار أكثر من واحد'}:\n${opts}`;
+            })
+            .join('\n\n');
+
+        return `أنت مساعد ذكي ودود اسمك "جاهز AI" تعمل في تطبيق جاهز لتوصيل الطعام.
+تتحدث بالعربية بلهجة سعودية نجدية ودية، ردودك قصيرة جداً (جملة واحدة).
+
+**الوضع الحالي: تخصيص وجبة**
+المستخدم فاتح بطاقة "${combo.name_ar}" من ${combo.restaurant_ar} ويبي يخصصها بصوته.
+
+**تفاصيل الوجبة:**
+- السعر الأساسي: ${combo.base_price} ريال
+- المجموعات المتاحة:
+
+${groupsText}
+
+**المهام:**
+1. رحّب بالمستخدم قصير جداً واسأله وش يبي الحجم (أول مجموعة مطلوبة).
+2. **مهم:** في كل مرة المستخدم يقول اختيار (مثل "كبير" أو "كولا" أو "بطاطس حلزونية" أو "بدون مخلل")، استخدم أداة customize_combo فوراً مع:
+   - group_id المناسب
+   - option_ids (مصفوفة من IDs المطابقة)
+   - action: 'set' للمجموعات single ('الحجم'، 'البطاطس'، 'المشروب')، 'add' للإضافات، 'remove' للحذف
+3. بعد كل تعديل، أكّد بجملة قصيرة: "تمام، كبير" أو "أبشر، بدون مخلل".
+4. بعد ما تنتهي جميع المجموعات المطلوبة، اسأل: "كذا تمام؟ أضيفها للسلة؟"
+5. لما يقول "نعم" أو "أكد" أو "خلاص" أو "أضف"، استخدم add_active_combo_to_cart.
+
+**فهم اللهجة:**
+- "صغير/وسط/كبير" → size
+- "كولا/سبرايت/بيبسي/كولا زيرو/شاي/قهوة" → drink
+- "زيدي/ضيف/أبي" + اسم الإضافة → extras action='add'
+- "بدون/شيل/ما أبي" + اسم العنصر → remove action='add'
+
+**تعليمات حاسمة:**
+- لا تذكر IDs في ردك الصوتي أبداً.
+- ردودك قصيرة جداً — كلمة أو كلمتين.
+- استخدم customize_combo فور ما يقول المستخدم اختياره، لا تنتظر.
+- الأسعار بالريال السعودي.
+- شخصيتك: "أبشر"، "تمام"، "حاضر"، "على راسي".
+
+**رسائل [تحديث من الواجهة]:**
+لما تشوف رسالة تبدأ بـ "[تحديث من الواجهة]"، هذي مش كلام المستخدم — هذي إشعار من نظام الواجهة يخبرك إن المستخدم ضغط خيار بنفسه على البطاقة. **لا ترد عليها صوتياً ولا تستخدم customize_combo (لأن الواجهة حدّثت حالها بنفسها).** فقط اعتبر الاختيار صار، وخذه بعين الاعتبار في جوابك القادم لما المستخدم يتكلم. إذا كانت كل المجموعات المطلوبة تم تعبئتها، في ردك القادم اسأله "كذا تمام؟ أضيفها؟".`;
     };
 
     // Build updated instructions after restaurant selection (with full menu)
@@ -727,12 +785,17 @@ ${restaurant.ai_voice_context}
 **القائمة الكاملة:**
 ${menuText}
 
+**الوجبات (Combos) المتاحة للتخصيص بالصوت:**
+${combosCatalogForPrompt()}
+
 **User ID:** '${userId || 'guest-user-123'}'
 
 **المهام:**
 1. ساعد المستخدم في اختيار أصناف من القائمة.
 2. لما يطلب صنف، أكّد الاسم والسعر بجملة وحدة.
-3. **مهم جداً:** بعد كل إضافة أو تعديل أو حذف صنف، استخدم أداة update_cart فوراً وأرسل الطلب الكامل الحالي (جميع الأصناف مع الكميات والأسعار).
+3. **مهم جداً:** بعد كل إضافة أو تعديل أو حذف صنف عادي (غير الوجبات)، استخدم أداة update_cart فوراً وأرسل الطلب الكامل الحالي (جميع الأصناف مع الكميات والأسعار).
+3.1. **قاعدة open_combo_customizer (صارمة):** استخدمها **فقط** للأصناف المدرجة حرفياً بـ combo_id في قسم "الوجبات (Combos) المتاحة للتخصيص بالصوت" أعلاه (حالياً فقط mcd_big_mac_meal). **أي صنف آخر في القائمة — حتى لو كان في قسم "وجبات وساندويتشات" أو يحتوي كلمة "وجبة" في اسمه — استخدم update_cart بشكل طبيعي.** أمثلة: "٩ قطع ماك ناجتس" → update_cart. "بيج ماك ساندويتش فقط" → update_cart. "وجبة بيج ماك" → open_combo_customizer. بعد فتح البطاقة، استخدم customize_combo لكل اختيار، وأخيراً add_active_combo_to_cart للتأكيد.
+3.2. **تحذير:** لا تخترع combo_id. إذا لم تجد الصنف حرفياً في قائمة الـ Combos أعلاه، استخدم update_cart.
 4. لما يقول "أكد" أو "خلاص" أو "تمم" أو "بس كذا"، استخدم confirm_order واذكر ملخص الطلب والمجموع.
 5. لو يبي يغيّر المطعم، استخدم select_restaurant.
 6. لو سأل "وش عندكم" أو "قولي الأقسام"، اذكر أسماء الأقسام فقط: ${restaurant.menu_json.map((c: any) => c.category_ar).join('، ')}.
@@ -826,6 +889,56 @@ ${menuText}
                     },
                     required: ["cuisine"]
                 }
+            },
+            {
+                type: "function",
+                name: "open_combo_customizer",
+                description: "Open the voice customization card ONLY for combos that appear in the combo catalog in your instructions (currently only 'mcd_big_mac_meal'). Do NOT call this for regular menu items, even if they are inside a restaurant category named 'وجبات' or contain the word 'وجبة' in their name (e.g. '9 Piece Chicken McNuggets' is a regular item — use update_cart). Do NOT invent combo_ids. If the item is not literally listed as a combo with an explicit combo_id, use update_cart instead.",
+                parameters: {
+                    type: "object",
+                    properties: {
+                        combo_id: {
+                            type: "string",
+                            description: "The id of the combo to open, exactly as listed in the combo catalog (e.g. 'mcd_big_mac_meal'). You can also pass the Arabic or English name and the system will fuzzy-match."
+                        }
+                    },
+                    required: ["combo_id"]
+                }
+            },
+            {
+                type: "function",
+                name: "customize_combo",
+                description: "Update a selection on the currently active combo card visible on the user's screen. Call this IMMEDIATELY when the user says a modifier (size, fries type, drink, add-on, or remove). Never wait — call it at the same time you speak the confirmation.",
+                parameters: {
+                    type: "object",
+                    properties: {
+                        group_id: {
+                            type: "string",
+                            description: "The modifier group id exactly as listed in the combo details (e.g. 'size', 'fries', 'drink', 'extras', 'remove')."
+                        },
+                        option_ids: {
+                            type: "array",
+                            description: "Array of option ids to apply (e.g. ['size_l'], ['extra_cheese','extra_bacon']). Use ids from the combo details, not Arabic names.",
+                            items: { type: "string" }
+                        },
+                        action: {
+                            type: "string",
+                            enum: ["set", "add", "remove", "clear"],
+                            description: "'set' replaces the group's selection (for single-select groups). 'add' appends (for extras/remove). 'remove' removes the listed ids. 'clear' empties the group."
+                        }
+                    },
+                    required: ["group_id", "option_ids", "action"]
+                }
+            },
+            {
+                type: "function",
+                name: "add_active_combo_to_cart",
+                description: "Finalize the currently active combo with its current selections and add it to the cart. Call this when the user confirms (says 'خلاص', 'أكد', 'تمم', 'أضف'). Will fail if required groups are still unfilled.",
+                parameters: {
+                    type: "object",
+                    properties: {},
+                    required: []
+                }
             }
         ];
 
@@ -874,11 +987,20 @@ ${menuText}
                 setIsConnected(true);
                 setStatus('Ready');
 
-                // Initialize Session with restaurant-selection instructions
+                // Branch: combo mode vs restaurant-selection mode
+                const activeCombo = comboStore.getState().activeCombo;
+                const instructions = activeCombo
+                    ? getComboInstructions(activeCombo)
+                    : getInitialInstructions();
+                const greeting = activeCombo
+                    ? `رحّب بالمستخدم كلمتين فقط ("هلا!" أو "أبشر!") ثم اسأله على طول عن ${activeCombo.groups.find((g) => g.required)?.title_ar || 'الحجم'}. جملة واحدة قصيرة.`
+                    : `رحّب بالمستخدم ترحيب حار وقصير وعرّف عن نفسك إنك "جاهز AI" واسأله وش يشتهي اليوم — برقر، دجاج، شاورما، بيتزا، أو قهوة؟ جملتين فقط لا تطوّل. لا تذكر أسماء مطاعم.`;
+
+                // Initialize Session
                 const sessionUpdate = {
                     type: 'session.update',
                     session: {
-                        instructions: getInitialInstructions(),
+                        instructions,
                         voice: 'alloy',
                         turn_detection: { type: 'server_vad', threshold: 0.45, prefix_padding_ms: 500, silence_duration_ms: 750 },
                         modalities: ["text", "audio"],
@@ -891,14 +1013,14 @@ ${menuText}
                 };
                 socket.send(JSON.stringify(sessionUpdate));
 
-                // Trigger initial greeting — mood-based, ask what cuisine they want
+                // Trigger initial greeting — context-aware
                 setTimeout(() => {
-                    console.log('Requesting AI greeting...');
+                    console.log(`Requesting AI greeting... mode=${activeCombo ? 'combo:' + activeCombo.id : 'restaurant-picker'}`);
                     socket.send(JSON.stringify({
                         type: 'response.create',
                         response: {
                             modalities: ['text', 'audio'],
-                            instructions: `رحّب بالمستخدم ترحيب حار وقصير وعرّف عن نفسك إنك "جاهز AI" واسأله وش يشتهي اليوم — برقر، دجاج، شاورما، بيتزا، أو قهوة؟ جملتين فقط لا تطوّل. لا تذكر أسماء مطاعم.`
+                            instructions: greeting
                         }
                     }));
                 }, 500);
@@ -973,6 +1095,12 @@ ${menuText}
                             result = handleUpdateCart(args);
                         } else if (name === 'confirm_order') {
                             result = handleConfirmOrder(args);
+                        } else if (name === 'open_combo_customizer') {
+                            result = handleOpenComboCustomizer(args, socket);
+                        } else if (name === 'customize_combo') {
+                            result = handleCustomizeCombo(args);
+                        } else if (name === 'add_active_combo_to_cart') {
+                            result = handleAddActiveComboToCart(socket);
                         } else {
                             result = { error: `Unknown tool: ${name}` };
                         }
@@ -1110,6 +1238,165 @@ ${menuText}
             items_count: args.items.length,
             subtotal: subtotal,
             message: `تم تحديث السلة. ${args.items.length} صنف، المجموع الفرعي: ${subtotal} ريال`
+        };
+    };
+
+    // Handle open_combo_customizer — AI opens the combo card for voice customization
+    const handleOpenComboCustomizer = (args: { combo_id: string }, socket: WebSocket) => {
+        const combo = findCombo(args.combo_id);
+        if (!combo) {
+            return {
+                success: false,
+                error: `Unknown combo '${args.combo_id}'. Valid combos are listed in the combo catalog.`,
+            };
+        }
+
+        comboStore.setActive(combo);
+
+        // Switch AI instructions into combo-customization mode so it knows group/option IDs
+        socket.send(JSON.stringify({
+            type: 'session.update',
+            session: {
+                instructions: getComboInstructions(combo),
+            },
+        }));
+
+        console.log(`[TOOL] open_combo_customizer: opened "${combo.name_ar}" (${combo.id})`);
+
+        const firstRequired = combo.groups.find((g) => g.required);
+
+        return {
+            success: true,
+            combo_id: combo.id,
+            combo_name_ar: combo.name_ar,
+            restaurant_ar: combo.restaurant_ar,
+            base_price: combo.base_price,
+            first_required_group_ar: firstRequired?.title_ar || null,
+            first_required_group_id: firstRequired?.id || null,
+            groups: combo.groups.map((g) => ({
+                id: g.id,
+                title_ar: g.title_ar,
+                required: g.required,
+                select: g.select,
+                options: g.options.map((o) => ({ id: o.id, name_ar: o.name_ar, price_delta: o.price_delta })),
+            })),
+            message: `تم فتح بطاقة ${combo.name_ar}. اسأل المستخدم عن ${firstRequired?.title_ar || 'الاختيارات'} الآن.`,
+        };
+    };
+
+    // Handle customize_combo — voice-driven update to the active combo card
+    const handleCustomizeCombo = (args: { group_id: string; option_ids: string[]; action: 'set' | 'add' | 'remove' | 'clear' }) => {
+        const activeCombo = comboStore.getState().activeCombo;
+        if (!activeCombo) {
+            return { success: false, error: 'No active combo. The user is not customizing any combo right now.' };
+        }
+
+        const group = activeCombo.groups.find((g) => g.id === args.group_id);
+        if (!group) {
+            return {
+                success: false,
+                error: `Unknown group_id '${args.group_id}'. Valid groups: ${activeCombo.groups.map((g) => g.id).join(', ')}`,
+            };
+        }
+
+        const validIds = new Set(group.options.map((o) => o.id));
+        const unknownIds = (args.option_ids || []).filter((id) => !validIds.has(id));
+        if (unknownIds.length > 0 && args.action !== 'clear') {
+            return {
+                success: false,
+                error: `Unknown option ids in group '${group.id}': ${unknownIds.join(', ')}. Valid: ${group.options.map((o) => o.id).join(', ')}`,
+            };
+        }
+
+        comboStore.applyAIChange(activeCombo.id, args.group_id, args.option_ids || [], args.action);
+
+        const newState = comboStore.getState().byId[activeCombo.id];
+        const selectedNames = (newState?.selections[args.group_id] ?? [])
+            .map((id) => group.options.find((o) => o.id === id)?.name_ar)
+            .filter(Boolean);
+
+        console.log(`[TOOL] customize_combo: ${args.group_id} ${args.action} ${args.option_ids.join(',')} → now [${selectedNames.join('، ')}]`);
+
+        return {
+            success: true,
+            group_id: args.group_id,
+            group_title_ar: group.title_ar,
+            current_selection_ar: selectedNames,
+            message: `تم تحديث ${group.title_ar}: ${selectedNames.join('، ') || 'فارغ'}`,
+        };
+    };
+
+    // Handle add_active_combo_to_cart — finalize combo and add as cart line
+    const handleAddActiveComboToCart = (socket: WebSocket) => {
+        const s = comboStore.getState();
+        const activeCombo = s.activeCombo;
+        if (!activeCombo) {
+            return { success: false, error: 'No active combo to add.' };
+        }
+        const perCombo = s.byId[activeCombo.id];
+        if (!perCombo) {
+            return { success: false, error: 'Active combo has no state.' };
+        }
+
+        const unfilled = activeCombo.groups.filter(
+            (g) => g.required && (perCombo.selections[g.id]?.length ?? 0) === 0
+        );
+        if (unfilled.length > 0) {
+            return {
+                success: false,
+                error: `Cannot add combo — required groups still empty: ${unfilled.map((g) => g.title_ar).join('، ')}. Ask the user to pick these first.`,
+                unfilled_groups_ar: unfilled.map((g) => g.title_ar),
+            };
+        }
+
+        // Build summary + price
+        let mod = 0;
+        const parts: string[] = [];
+        activeCombo.groups.forEach((g) => {
+            const picked = perCombo.selections[g.id] ?? [];
+            picked.forEach((pid) => {
+                const opt = g.options.find((o) => o.id === pid);
+                if (!opt) return;
+                mod += opt.price_delta;
+                if (opt.price_delta > 0 || !opt.default) parts.push(opt.name_ar);
+            });
+        });
+        const unitPrice = activeCombo.base_price + mod;
+        const lineTotal = unitPrice * perCombo.quantity;
+        const summaryAr = `${activeCombo.name_ar}${parts.length ? ' - ' + parts.join('، ') : ''}`;
+
+        const newItem: CartItem = {
+            name_ar: summaryAr,
+            name_en: activeCombo.name_en,
+            quantity: perCombo.quantity,
+            unit_price: unitPrice,
+            notes: undefined,
+        };
+        setCartItems((prev) => [...prev, newItem]);
+        comboStore.reset(activeCombo.id, activeCombo);
+        // Clear the active combo so the voice card disappears from the overlay.
+        // A new combo may appear later if the user orders another one.
+        comboStore.clearActive();
+
+        // Restore general-mode instructions so the AI is ready for the next item.
+        // If a restaurant is selected, use its menu instructions; otherwise the initial picker.
+        const restored = selectedRestaurantRef.current
+            ? getMenuInstructions(selectedRestaurantRef.current)
+            : getInitialInstructions();
+        socket.send(JSON.stringify({
+            type: 'session.update',
+            session: { instructions: restored },
+        }));
+
+        console.log(`[TOOL] add_active_combo_to_cart: +${summaryAr} × ${perCombo.quantity} = ${lineTotal} ر.س — combo card closed, instructions restored`);
+
+        return {
+            success: true,
+            added_item_ar: summaryAr,
+            quantity: perCombo.quantity,
+            unit_price: unitPrice,
+            line_total: lineTotal,
+            message: `تمت إضافة ${summaryAr} × ${perCombo.quantity} — المجموع ${lineTotal.toFixed(0)} ريال.`,
         };
     };
 
@@ -1463,6 +1750,73 @@ ${menuText}
                     <ScrollView ref={scrollViewRef} contentContainerStyle={{ paddingBottom: 20 }}
                         onContentSizeChange={() => scrollViewRef.current?.scrollToEnd({ animated: true })}
                         showsVerticalScrollIndicator={false}>
+                        {/* Active Combo Card — visible when user tapped voice pill on a ComboCard */}
+                        {activeCombo ? (
+                            <View style={{ marginHorizontal: 4, marginBottom: 12 }}>
+                                <ComboCard
+                                    combo={activeCombo}
+                                    hideVoicePill
+                                    compact
+                                    onUserSelect={(groupId, optionIds) => {
+                                        if (!ws.current || ws.current.readyState !== WebSocket.OPEN) return;
+                                        const group = activeCombo.groups.find((g) => g.id === groupId);
+                                        if (!group) return;
+                                        const names = optionIds
+                                            .map((id) => group.options.find((o) => o.id === id)?.name_ar)
+                                            .filter(Boolean)
+                                            .join('، ') || 'لا شيء';
+                                        const text = `[تحديث من الواجهة] المستخدم غيّر "${group.title_ar}" يدوياً إلى: ${names}. لا تعلّق، فقط تابع وسجّل هذا في ذاكرتك.`;
+                                        ws.current.send(JSON.stringify({
+                                            type: 'conversation.item.create',
+                                            item: {
+                                                type: 'message',
+                                                role: 'user',
+                                                content: [{ type: 'input_text', text }],
+                                            },
+                                        }));
+                                        console.log('[UI→AI]', text);
+                                    }}
+                                    onUserQuantity={(q) => {
+                                        if (!ws.current || ws.current.readyState !== WebSocket.OPEN) return;
+                                        const text = `[تحديث من الواجهة] المستخدم غيّر الكمية يدوياً إلى ${q}. لا تعلّق، فقط تابع.`;
+                                        ws.current.send(JSON.stringify({
+                                            type: 'conversation.item.create',
+                                            item: {
+                                                type: 'message',
+                                                role: 'user',
+                                                content: [{ type: 'input_text', text }],
+                                            },
+                                        }));
+                                        console.log('[UI→AI]', text);
+                                    }}
+                                    onAddToCart={(payload) => {
+                                        setCartItems((prev) => [
+                                            ...prev,
+                                            {
+                                                name_ar: payload.summary_ar,
+                                                name_en: activeCombo.name_en,
+                                                quantity: payload.quantity,
+                                                unit_price: payload.unit_price,
+                                                notes: undefined,
+                                            },
+                                        ]);
+                                        if (ws.current && ws.current.readyState === WebSocket.OPEN) {
+                                            const text = `[تحديث من الواجهة] المستخدم ضغط زر "إضافة" بنفسه. تمت إضافة ${payload.summary_ar} × ${payload.quantity} بسعر ${payload.line_total.toFixed(0)} ريال للسلة. الوجبة تم إنهاؤها. اسأله باختصار إذا يبي شي ثاني.`;
+                                            ws.current.send(JSON.stringify({
+                                                type: 'conversation.item.create',
+                                                item: {
+                                                    type: 'message',
+                                                    role: 'user',
+                                                    content: [{ type: 'input_text', text }],
+                                                },
+                                            }));
+                                            console.log('[UI→AI]', text);
+                                        }
+                                        comboStore.clearActive();
+                                    }}
+                                />
+                            </View>
+                        ) : null}
                         {messages.map((msg, idx) => (
                             <View key={idx} style={msg.role === 'user' ? s.userBubble : s.aiBubble}>
                                 <Text style={msg.role === 'user' ? s.userText : s.aiText}>{msg.text}</Text>
@@ -1590,7 +1944,7 @@ const s = StyleSheet.create({
     aiText: { fontSize: 16, color: '#333', lineHeight: 24, textAlign: 'right' },
     muteToast: { position: 'absolute', bottom: 150, alignSelf: 'center', backgroundColor: 'rgba(0,0,0,0.75)', borderRadius: 22, paddingHorizontal: 18, paddingVertical: 10, flexDirection: 'row', alignItems: 'center', gap: 8, zIndex: 30 },
     toastText: { fontSize: 14, color: '#fff', fontWeight: '500' },
-    bottomBar: { position: 'absolute', bottom: 65, width: '100%', flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 20, zIndex: 15 },
+    bottomBar: { position: 'absolute', bottom: 65, width: '100%', height: 80, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 20, zIndex: 15 },
     endBtn: { width: 52, height: 52, borderRadius: 26, backgroundColor: '#ff3b30', alignItems: 'center', justifyContent: 'center' },
     micBtn: { backgroundColor: '#000', alignItems: 'center', justifyContent: 'center', overflow: 'hidden' },
     micIconWrap: { position: 'absolute', alignItems: 'center', justifyContent: 'center' },
