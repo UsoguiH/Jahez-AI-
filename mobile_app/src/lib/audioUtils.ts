@@ -40,6 +40,40 @@ const writeString = (view: DataView, offset: number, string: string) => {
     }
 };
 
+// Compute per-frame amplitude envelope (0..1) from base64 PCM16 audio,
+// so the AI visualizer bars can track the actual speech loudness.
+export const computeAmplitudeEnvelope = (pcmBase64: string, sampleRate = 24000, fps = 30): number[] => {
+    const binaryString = global.atob(pcmBase64);
+    const len = binaryString.length;
+    // Each sample is 2 bytes (Int16 LE)
+    const sampleCount = Math.floor(len / 2);
+    const windowSize = Math.max(1, Math.floor(sampleRate / fps));
+    const envelope: number[] = [];
+    let peak = 1;
+
+    for (let i = 0; i < sampleCount; i += windowSize) {
+        const end = Math.min(i + windowSize, sampleCount);
+        let sumSquares = 0;
+        for (let j = i; j < end; j++) {
+            const lo = binaryString.charCodeAt(j * 2);
+            const hi = binaryString.charCodeAt(j * 2 + 1);
+            // Reconstruct signed 16-bit sample
+            let s = (hi << 8) | lo;
+            if (s >= 0x8000) s -= 0x10000;
+            sumSquares += s * s;
+        }
+        const rms = Math.sqrt(sumSquares / (end - i));
+        envelope.push(rms);
+        if (rms > peak) peak = rms;
+    }
+
+    // Normalize to 0..1 with mild compression so quiet syllables still register
+    return envelope.map(v => {
+        const n = v / peak;
+        return Math.min(1, Math.pow(n, 0.7));
+    });
+};
+
 export const appendWavHeader = (pcmBase64: string, sampleRate = 24000) => {
     // Decode base64 to binary string
     const binaryString = global.atob(pcmBase64);

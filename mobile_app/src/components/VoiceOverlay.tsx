@@ -10,6 +10,7 @@ import { supabase } from '../lib/supabase';
 import { Ionicons, MaterialIcons } from '@expo/vector-icons';
 import OrderCartWidget, { CartItem } from './OrderCartWidget';
 import CheckoutScreen from './CheckoutScreen';
+import AIVisualizer, { AIVisualizerHandle } from './AIVisualizer';
 import InlineCartWidget from './InlineCartWidget';
 import OrderConfirmation from './OrderConfirmation';
 import RestaurantSuggestions, { CUISINE_MAP } from './RestaurantSuggestions';
@@ -51,6 +52,8 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
     const [orderDetails, setOrderDetails] = useState<{ summary: string; total: number } | null>(null);
     const [showFullCart, setShowFullCart] = useState(false);
     const [showCheckout, setShowCheckout] = useState(false);
+    const [chatReady, setChatReady] = useState(false);
+    const aiAmplitudeRef = useRef(0);
     const [suggestedRestaurants, setSuggestedRestaurants] = useState<{name_ar: string; name_en: string; id: string}[]>([]);
     const [activeRestaurantUI, setActiveRestaurantUI] = useState<Restaurant | null>(null);
     const scrollViewRef = useRef<ScrollView>(null);
@@ -59,6 +62,19 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
     const audioBuffer = useRef<string>('');
     const currentSound = useRef<Audio.Sound | null>(null);
     const isSpeaking = useRef<boolean>(false);
+    // Interrupt tracking — capture AI response item_id + live playback position so we can
+    // truncate the assistant's turn at the exact ms the user stopped listening.
+    const currentResponseItemIdRef = useRef<string | null>(null);
+    const playbackPositionMsRef = useRef<number>(0);
+    const holdTimerRef = useRef<any>(null);
+    const longPressFiredRef = useRef<boolean>(false);
+    const interruptProgress = useRef(new Animated.Value(0)).current;
+    // Set true while an interrupt is "in effect" — blocks late audio.delta / audio.done
+    // messages and pending playAudioChunk calls from restarting playback after interrupt.
+    // Reset on the next response.created so the NEXT assistant turn plays normally.
+    const aiResponseInterruptedRef = useRef<boolean>(false);
+    // Imperative handle to the visualizer so interrupt can snap it to the orb instantly.
+    const visualizerRef = useRef<AIVisualizerHandle | null>(null);
 
     // Restaurant menu data — pre-loaded on mic open for zero latency
     const restaurantsRef = useRef<Restaurant[]>([]);
@@ -90,7 +106,7 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
     const waveIntervalRef = useRef<any>(null);
     const breathTweenRef = useRef<Animated.CompositeAnimation | null>(null);
     const barAnimRefs = useRef<(Animated.CompositeAnimation | null)[]>([]);
-    const LIFT = -140;
+    const LIFT = -180;
 
     // ===== ChatGPT Design: Animation Values =====
     const statusOpacity = useRef(new Animated.Value(1)).current;
@@ -518,8 +534,11 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
             ),
         ]).start();
 
-        // Auto-connect voice once the full motion has settled
-        setTimeout(() => handleMicPress(), 1360);
+        // Auto-connect voice once the full motion has settled; swap decorations → AI visualizer
+        setTimeout(() => {
+            setChatReady(true);
+            handleMicPress();
+        }, 1360);
     };
 
     const handleEndSession = () => {
@@ -551,6 +570,7 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
             selectedRestAnimScale.setValue(0);
             setCartItems([]); setOrderConfirmed(false); setOrderDetails(null);
             setShowFullCart(false); setSuggestedRestaurants([]); setMessages([]); setCurrentAiText('');
+            setChatReady(false);
             runConnectingSequence();
         }, 700);
     };
@@ -632,6 +652,107 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
     useEffect(() => {
         if (isListening && appPhase === 'chat') { startVisualizer(); }
     }, [isListening, appPhase]);
+
+    // =====================================================
+    // AI INTERRUPT (long-press mic 3s while AI is speaking)
+    // Preserves context: stops local playback + truncates the assistant item at the
+    // exact ms the user heard, so the model's memory matches what was actually spoken.
+    // =====================================================
+    const interruptAI = async () => {
+        // Arm the guard FIRST — any audio.delta / audio.done / in-flight playAudioChunk
+        // still in progress will see this and bail instead of restarting playback.
+        aiResponseInterruptedRef.current = true;
+
+        // Snap the visualizer to the listening orb instantly (skips the ~850ms
+        // respond→listen transition so the user sees the orb "listen mode" immediately).
+        visualizerRef.current?.forceListen();
+
+        // Detach the sound's status callback BEFORE stopping, so a final status update
+        // can't flip isAiSpeaking back on or write to aiAmplitudeRef after we reset.
+        const sound = currentSound.current;
+        if (sound) {
+            try { sound.setOnPlaybackStatusUpdate(null); } catch {}
+            try { await sound.stopAsync(); } catch {}
+            try { await sound.unloadAsync(); } catch {}
+            if (currentSound.current === sound) currentSound.current = null;
+        }
+        aiAmplitudeRef.current = 0;
+
+        const socket = ws.current;
+        const itemId = currentResponseItemIdRef.current;
+        const audioEndMs = Math.max(0, Math.floor(playbackPositionMsRef.current));
+
+        if (socket && socket.readyState === WebSocket.OPEN) {
+            // Cancel any in-flight generation (no-op if the model already finished)
+            try { socket.send(JSON.stringify({ type: 'response.cancel' })); } catch {}
+            // Truncate the assistant turn so the model's context reflects what the user heard
+            if (itemId) {
+                try {
+                    socket.send(JSON.stringify({
+                        type: 'conversation.item.truncate',
+                        item_id: itemId,
+                        content_index: 0,
+                        audio_end_ms: audioEndMs,
+                    }));
+                } catch {}
+            }
+        }
+
+        currentResponseItemIdRef.current = null;
+        playbackPositionMsRef.current = 0;
+        audioBuffer.current = '';
+        isSpeaking.current = false;
+        setIsAiSpeaking(false);
+
+        // Brief toast so the user knows the interrupt landed
+        setMuteToastText('تم إيقاف المساعد');
+        Animated.sequence([
+            Animated.parallel([
+                Animated.timing(toastOpacity, { toValue: 1, duration: 220, useNativeDriver: true }),
+                Animated.timing(toastTransY, { toValue: 0, duration: 220, useNativeDriver: true }),
+            ]),
+            Animated.delay(1000),
+            Animated.timing(toastOpacity, { toValue: 0, duration: 200, useNativeDriver: true }),
+        ]).start(() => toastTransY.setValue(8));
+    };
+
+    const handleMicPressIn = () => {
+        longPressFiredRef.current = false;
+        // Only arm the interrupt while the AI is actually speaking
+        if (!isAiSpeaking) return;
+        Animated.timing(interruptProgress, {
+            toValue: 1,
+            duration: 3000,
+            easing: Easing.linear,
+            useNativeDriver: false,
+        }).start();
+        holdTimerRef.current = setTimeout(() => {
+            longPressFiredRef.current = true;
+            interruptAI();
+            interruptProgress.setValue(0);
+        }, 3000);
+    };
+
+    const handleMicPressOut = () => {
+        if (holdTimerRef.current) {
+            clearTimeout(holdTimerRef.current);
+            holdTimerRef.current = null;
+        }
+        Animated.timing(interruptProgress, {
+            toValue: 0,
+            duration: 200,
+            useNativeDriver: false,
+        }).start();
+    };
+
+    const handleMicTap = () => {
+        // If the long-press interrupt already fired, don't also toggle mute
+        if (longPressFiredRef.current) {
+            longPressFiredRef.current = false;
+            return;
+        }
+        toggleMute();
+    };
 
     // Build the initial AI instructions (mood-based, no listing all restaurants)
     const getInitialInstructions = () => {
@@ -1040,6 +1161,9 @@ ${combosCatalogForPrompt()}
                     }
 
                     if (msg.type === 'response.created') {
+                        // New assistant turn starting — clear the interrupt guard so this
+                        // turn is allowed to stream and play normally.
+                        aiResponseInterruptedRef.current = false;
                         // AI is generating — mute mic during playback to prevent echo
                         isSpeaking.current = true;
                         setIsAiSpeaking(true);
@@ -1047,12 +1171,24 @@ ${combosCatalogForPrompt()}
                     }
 
                     if (msg.type === 'response.audio.delta' && msg.delta) {
-                        audioBuffer.current += msg.delta;
+                        // If the user interrupted this turn, drop any straggler chunks.
+                        if (aiResponseInterruptedRef.current) { /* drop */ }
+                        else {
+                            if (msg.item_id && !currentResponseItemIdRef.current) {
+                                currentResponseItemIdRef.current = msg.item_id;
+                            }
+                            audioBuffer.current += msg.delta;
+                        }
                     }
 
                     if (msg.type === 'response.audio.done') {
                         console.log('Audio complete, playing buffered audio, length:', audioBuffer.current.length);
-                        if (audioBuffer.current.length > 0) {
+                        // If interrupted, skip playback entirely — buffer was already cleared
+                        // in interruptAI, but guard anyway in case delta arrived between clear
+                        // and guard arming.
+                        if (aiResponseInterruptedRef.current) {
+                            audioBuffer.current = '';
+                        } else if (audioBuffer.current.length > 0) {
                             await playAudioChunk(audioBuffer.current);
                             audioBuffer.current = '';
                         }
@@ -1459,6 +1595,8 @@ ${combosCatalogForPrompt()}
 
     const playAudioChunk = async (pcmBase64: string) => {
         if (!pcmBase64) return;
+        // Short-circuit if the user already interrupted before this chunk began.
+        if (aiResponseInterruptedRef.current) return;
         try {
             if (currentSound.current) {
                 try {
@@ -1467,21 +1605,52 @@ ${combosCatalogForPrompt()}
                 } catch (e) { /* ignore */ }
                 currentSound.current = null;
             }
+            if (aiResponseInterruptedRef.current) return;
 
-            const { appendWavHeader } = await import('../lib/audioUtils');
+            const { appendWavHeader, computeAmplitudeEnvelope } = await import('../lib/audioUtils');
+            if (aiResponseInterruptedRef.current) return;
+
+            // Pre-compute amplitude envelope at 30 FPS so the visualizer bars track real speech loudness.
+            const envelope = computeAmplitudeEnvelope(pcmBase64, 24000, 30);
+            const envelopeFps = 30;
+
             const wavData = appendWavHeader(pcmBase64);
             const uri = (FileSystem.cacheDirectory || FileSystem.documentDirectory || '') + `response_${Date.now()}.wav`;
             await FileSystem.writeAsStringAsync(uri, wavData, { encoding: FileSystem.EncodingType.Base64 });
-            const { sound: newSound } = await Audio.Sound.createAsync({ uri });
+            if (aiResponseInterruptedRef.current) return;
+
+            const { sound: newSound } = await Audio.Sound.createAsync(
+                { uri },
+                { progressUpdateIntervalMillis: 33 }
+            );
+            // If we were interrupted while the sound was loading, throw it away
+            // instead of starting playback.
+            if (aiResponseInterruptedRef.current) {
+                try { await newSound.unloadAsync(); } catch {}
+                return;
+            }
             currentSound.current = newSound;
             await newSound.playAsync();
             newSound.setOnPlaybackStatusUpdate(status => {
-                if (status.isLoaded && status.didJustFinish) {
-                    newSound.unloadAsync();
-                    if (currentSound.current === newSound) currentSound.current = null;
-                    console.log('Playback finished — resuming mic input');
-                    isSpeaking.current = false;
-                    setIsAiSpeaking(false);
+                // Guard every status update — once interrupted, the sound is being
+                // torn down and we must not touch any shared refs/state.
+                if (aiResponseInterruptedRef.current) return;
+                if (status.isLoaded) {
+                    if (status.isPlaying && !status.didJustFinish) {
+                        playbackPositionMsRef.current = status.positionMillis;
+                        const idx = Math.floor((status.positionMillis / 1000) * envelopeFps);
+                        aiAmplitudeRef.current = envelope[idx] ?? 0;
+                    }
+                    if (status.didJustFinish) {
+                        aiAmplitudeRef.current = 0;
+                        playbackPositionMsRef.current = 0;
+                        currentResponseItemIdRef.current = null;
+                        newSound.unloadAsync();
+                        if (currentSound.current === newSound) currentSound.current = null;
+                        console.log('Playback finished — resuming mic input');
+                        isSpeaking.current = false;
+                        setIsAiSpeaking(false);
+                    }
                 }
             });
         } catch (error) { console.error('Play error', error); }
@@ -1704,47 +1873,57 @@ ${combosCatalogForPrompt()}
 
                 {/* Orb Container */}
                 <Animated.View style={[s.orbContainer, { transform: [{ translateY: orbTransY }] }]}>
-                    {/* Drop Blobs + Category Buttons (Rendered First = Behind) */}
-                    {dropScales.map((sc, i) => (
-                        <Animated.View key={`drop-${i}`} style={{
-                            position: 'absolute',
-                            opacity: dropOpacities[i],
-                            transform: [{ translateY: dropYs[i] }, { scale: sc }],
-                            alignItems: 'center',
-                            justifyContent: 'center',
-                        }}>
-                            <Animated.View style={{
-                                width: dropWidths[i],
-                                height: dropHeights[i],
-                                borderRadius: 999,
-                                backgroundColor: categoryLabels[i].color,
-                                alignItems: 'center',
-                                justifyContent: 'center',
-                                overflow: 'hidden'
-                            }}>
-                                <TouchableOpacity onPress={() => !categoryLabels[i].disabled && enterChatMode(i)} activeOpacity={categoryLabels[i].disabled ? 1 : 0.8}
-                                    style={s.dropTouchable}>
-                                    <Animated.View style={[s.labelRow, { opacity: labelOpacities[i], transform: [{ scale: labelScales[i] }] }]}>
-                                        <Text style={s.labelText}>{categoryLabels[i].text}</Text>
-                                        <Ionicons name={categoryLabels[i].iconName as any} size={22} color="#fff" style={{marginLeft: 8}} />
+                    {/* Pre-chat decorations: drop blobs, glow, core blob, loading dots — stay visible through the entrance lift, hidden once chat is settled */}
+                    {!chatReady && (
+                        <>
+                            {/* Drop Blobs + Category Buttons */}
+                            {dropScales.map((sc, i) => (
+                                <Animated.View key={`drop-${i}`} style={{
+                                    position: 'absolute',
+                                    opacity: dropOpacities[i],
+                                    transform: [{ translateY: dropYs[i] }, { scale: sc }],
+                                    alignItems: 'center',
+                                    justifyContent: 'center',
+                                }}>
+                                    <Animated.View style={{
+                                        width: dropWidths[i],
+                                        height: dropHeights[i],
+                                        borderRadius: 999,
+                                        backgroundColor: categoryLabels[i].color,
+                                        alignItems: 'center',
+                                        justifyContent: 'center',
+                                        overflow: 'hidden'
+                                    }}>
+                                        <TouchableOpacity onPress={() => !categoryLabels[i].disabled && enterChatMode(i)} activeOpacity={categoryLabels[i].disabled ? 1 : 0.8}
+                                            style={s.dropTouchable}>
+                                            <Animated.View style={[s.labelRow, { opacity: labelOpacities[i], transform: [{ scale: labelScales[i] }] }]}>
+                                                <Text style={s.labelText}>{categoryLabels[i].text}</Text>
+                                                <Ionicons name={categoryLabels[i].iconName as any} size={22} color="#fff" style={{marginLeft: 8}} />
+                                            </Animated.View>
+                                        </TouchableOpacity>
                                     </Animated.View>
-                                </TouchableOpacity>
-                            </Animated.View>
-                        </Animated.View>
-                    ))}
+                                </Animated.View>
+                            ))}
 
-                    {/* Blob Glow */}
-                    <Animated.View style={[s.blobGlow, { opacity: glowOpacity, transform: [{ scale: glowScale }] }]} />
-                    
-                    {/* Core Blob (Rendered Last = On Top) */}
-                    <Animated.View style={[s.coreBlob, { opacity: blobOpacity, transform: [{ scale: blobScale }, { translateY: blobTransY }] }]} />
-                    
-                    {/* Loading Dots */}
-                    {dotScales.map((sc, i) => (
-                        <Animated.View key={`dot-${i}`} style={[s.loadDot, {
-                            opacity: sc, transform: [{ translateX: dotXs[i] }, { translateY: dotYs[i] }, { scale: sc }, { scaleX: dotScaleXs[i] }, { scaleY: dotScaleYs[i] }],
-                        }]} />
-                    ))}
+                            {/* Blob Glow */}
+                            <Animated.View style={[s.blobGlow, { opacity: glowOpacity, transform: [{ scale: glowScale }] }]} />
+
+                            {/* Core Blob */}
+                            <Animated.View style={[s.coreBlob, { opacity: blobOpacity, transform: [{ scale: blobScale }, { translateY: blobTransY }] }]} />
+
+                            {/* Loading Dots */}
+                            {dotScales.map((sc, i) => (
+                                <Animated.View key={`dot-${i}`} style={[s.loadDot, {
+                                    opacity: sc, transform: [{ translateX: dotXs[i] }, { translateY: dotYs[i] }, { scale: sc }, { scaleX: dotScaleXs[i] }, { scaleY: dotScaleYs[i] }],
+                                }]} />
+                            ))}
+                        </>
+                    )}
+
+                    {/* AI Audio Visualizer — circle (listening) ↔ bars (responding, driven by live AI audio) */}
+                    {chatReady && (
+                        <AIVisualizer ref={visualizerRef} state={isAiSpeaking ? 'respond' : 'listen'} amplitudeRef={aiAmplitudeRef} />
+                    )}
                 </Animated.View>
 
                 {/* Chat Canvas */}
@@ -1857,7 +2036,27 @@ ${combosCatalogForPrompt()}
                     </Animated.View>
                     {/* Mic Button */}
                     <Animated.View style={{ opacity: bottomBtnOpacities[1], transform: [{ scale: bottomBtnScales[1] }] }}>
-                        <TouchableOpacity onPress={toggleMute} activeOpacity={0.85}>
+                        <TouchableOpacity
+                            onPress={handleMicTap}
+                            onPressIn={handleMicPressIn}
+                            onPressOut={handleMicPressOut}
+                            activeOpacity={0.85}
+                        >
+                            {/* Interrupt hold-progress ring — fills over 3s while pressed during AI speech */}
+                            <Animated.View
+                                pointerEvents="none"
+                                style={[
+                                    s.interruptRing,
+                                    {
+                                        width: Animated.add(micBtnWidth, new Animated.Value(16)),
+                                        height: Animated.add(micBtnHeight, new Animated.Value(16)),
+                                        borderRadius: Animated.add(micBtnRadius, new Animated.Value(8)),
+                                        opacity: interruptProgress,
+                                        borderWidth: interruptProgress.interpolate({ inputRange: [0, 1], outputRange: [0, 4] }),
+                                        transform: [{ scale: interruptProgress.interpolate({ inputRange: [0, 1], outputRange: [0.9, 1.05] }) }],
+                                    },
+                                ]}
+                            />
                             <Animated.View style={[s.micBtn, { width: micBtnWidth, height: micBtnHeight, borderRadius: micBtnRadius }]}>
                                 {/* Normal mic icon */}
                                 <Animated.View style={[s.micIconWrap, { opacity: micNormalOpacity }]}>
@@ -1952,6 +2151,7 @@ const s = StyleSheet.create({
     bottomBar: { position: 'absolute', bottom: 65, width: '100%', height: 80, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 20, zIndex: 15 },
     endBtn: { width: 52, height: 52, borderRadius: 26, backgroundColor: '#ff3b30', alignItems: 'center', justifyContent: 'center' },
     micBtn: { backgroundColor: '#000', alignItems: 'center', justifyContent: 'center', overflow: 'hidden' },
+    interruptRing: { position: 'absolute', top: -8, left: -8, borderColor: '#ff3b30', backgroundColor: 'transparent' },
     micIconWrap: { position: 'absolute', alignItems: 'center', justifyContent: 'center' },
     barsWrap: { position: 'absolute', alignItems: 'center', justifyContent: 'center' },
     visBar: { position: 'absolute', width: 10, backgroundColor: '#fff', borderRadius: 5 },
