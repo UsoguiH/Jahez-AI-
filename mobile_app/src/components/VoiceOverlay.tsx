@@ -19,6 +19,7 @@ import { comboStore, useActiveCombo } from '../state/comboStore';
 import { ComboItem } from '../data/mcdonaldsCombo';
 import { findCombo, combosCatalogForPrompt } from '../data/combos';
 import ComboCard from './ComboCard';
+import { buildMenuIndex, validateCartItems, MenuIndex } from '../lib/cartValidator';
 
 // Polyfill for global
 if (!global.btoa) { global.btoa = btoa; }
@@ -78,8 +79,16 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
 
     // Restaurant menu data — pre-loaded on mic open for zero latency
     const restaurantsRef = useRef<Restaurant[]>([]);
+    // Flat, normalized menu index for the currently selected restaurant —
+    // used by update_cart to validate every AI-supplied item against the real menu.
+    const menuIndexRef = useRef<MenuIndex>({ items: [] });
     const selectedRestaurantRef = useRef<Restaurant | null>(null);
     const menusLoadedRef = useRef<boolean>(false);
+    // Mirror cart state for synchronous reads inside tool handlers — needed so
+    // update_cart can read existing combo lines (which it must preserve) without
+    // the async nature of setState making it see stale values.
+    const cartItemsRef = useRef<CartItem[]>([]);
+    useEffect(() => { cartItemsRef.current = cartItems; }, [cartItems]);
 
     // Animation Values
     const pulseAnim = useRef(new Animated.Value(1)).current;
@@ -916,7 +925,7 @@ ${combosCatalogForPrompt()}
 **المهام:**
 1. ساعد المستخدم في اختيار أصناف من القائمة.
 2. لما يطلب صنف، أكّد الاسم والسعر بجملة وحدة.
-3. **مهم جداً:** بعد كل إضافة أو تعديل أو حذف صنف عادي (غير الوجبات)، استخدم أداة update_cart فوراً وأرسل الطلب الكامل الحالي (جميع الأصناف مع الكميات والأسعار).
+3. **مهم جداً:** بعد كل إضافة أو تعديل أو حذف صنف عادي (غير الوجبات)، استخدم أداة update_cart فوراً وأرسل **الأصناف العادية فقط** (بدون الوجبات/الكومبو) مع الكميات والأسعار. **لا ترسل أبداً أي سطر كومبو في update_cart** — الوجبات التي تمت إضافتها عبر add_active_combo_to_cart محفوظة تلقائياً في السلة بسعرها المعدّل، ولو أرسلتها في update_cart سيُستبدل سعرها بالسعر الأساسي ويحصل خطأ.
 3.1. **قاعدة open_combo_customizer (صارمة):** استخدمها **فقط** للأصناف المدرجة حرفياً بـ combo_id في قسم "الوجبات (Combos) المتاحة للتخصيص بالصوت" أعلاه (حالياً فقط mcd_big_mac_meal). **أي صنف آخر في القائمة — حتى لو كان في قسم "وجبات وساندويتشات" أو يحتوي كلمة "وجبة" في اسمه — استخدم update_cart بشكل طبيعي.** أمثلة: "٩ قطع ماك ناجتس" → update_cart. "بيج ماك ساندويتش فقط" → update_cart. "وجبة بيج ماك" → open_combo_customizer. بعد فتح البطاقة، استخدم customize_combo لكل اختيار، وأخيراً add_active_combo_to_cart للتأكيد.
 3.2. **تحذير:** لا تخترع combo_id. إذا لم تجد الصنف حرفياً في قائمة الـ Combos أعلاه، استخدم update_cart.
 4. لما يقول "أكد" أو "خلاص" أو "تمم" أو "بس كذا"، استخدم confirm_order واذكر ملخص الطلب والمجموع.
@@ -931,7 +940,17 @@ ${combosCatalogForPrompt()}
 - ردودك قصيرة جداً — جملة أو جملتين فقط.
 - لا تقرأ القائمة كاملة إلا إذا طلب ذلك.
 - الأسعار بالريال السعودي.
-- **لازم تستخدم update_cart بعد أي تغيير في الطلب — هذا يحدّث شاشة العميل.**`;
+- **لازم تستخدم update_cart بعد أي تغيير في الطلب — هذا يحدّث شاشة العميل.**
+
+**قواعد دقة الطلب — صارمة ومهمة جداً لتقليل الأخطاء:**
+1. **لا تخترع أصناف**. الصنف لازم يكون موجود حرفياً في "القائمة الكاملة" أعلاه. إذا المستخدم طلب صنف مش واضح، اسأله "قصدك X ولا Y؟" بدل ما تخمّن.
+2. **لا تخترع أسعار**. استخدم السعر المكتوب في القائمة بالضبط. النظام يصحّح الأسعار تلقائياً، لكن ردودك الصوتية لازم تكون بالسعر الصحيح من القائمة.
+3. **عند طلبات متعددة في جملة وحدة** مثل "واحد شاورما لحم وواحد شاورما دجاج"، **لازم تضيف كلا الصنفين في نفس update_cart**. لا تحذف صنف ولا تنسى صنف. عد الأصناف من كلام المستخدم قبل ما ترسل.
+4. **قراءة النتيجة من update_cart**: بعد كل استدعاء، النظام يرجّع items_ar (السلة الحقيقية)، rejected (أصناف مرفوضة)، corrected (أصناف تم تصحيحها). **اعتمد على هذه النتيجة — مش على ذاكرتك**.
+5. **إذا rejected.length > 0**: لا تؤكد الطلب. قل للمستخدم "ما لقيت [اسم الصنف] في القائمة. عندنا [أقرب 2-3 اقتراحات من suggestions]، أيهم تبي؟" واستنى رده قبل ما تكمّل.
+6. **إذا corrected.length > 0**: أعد قراءة الاسم الصحيح على المستخدم ("تقصد [الاسم الصحيح] بـ [السعر]، صح؟") للتأكيد.
+7. **قبل confirm_order**: **لازم** تقرأ ملخص السلة على المستخدم (كل صنف بالاسم والكمية + المجموع) وتستنى رد "نعم" أو "أكد" صريح. لا تؤكد بدون رد صريح من المستخدم. "تمم" أو "خلاص" بعد إضافة صنف = جاهز، مش تأكيد نهائي.
+8. **إذا المستخدم قال جملة غامضة** (مثل "زيد واحد" والسلة فيها أكثر من صنف، أو "بدون بصل" بدون تحديد الصنف)، اسأل "لأي صنف؟" بدل ما تختار لحالك.`;
     };
 
     const connectToOpenAIDirectly = async (authToken: string) => {
@@ -956,7 +975,7 @@ ${combosCatalogForPrompt()}
             {
                 type: "function",
                 name: "update_cart",
-                description: "Update the visual cart on the user's screen. Call this EVERY time the user adds, modifies, or removes an item. Send the FULL current cart (all items) each time, not just the change.",
+                description: "Update the visual cart on the user's screen for REGULAR menu items only (not combos/meals). Send the full current list of regular items each call — do NOT include combo/meal lines here; those are managed separately via add_active_combo_to_cart and preserved automatically with their modified prices. If you include a combo line here, its modifications/price will be lost. The system validates every regular item against the real menu and returns the authoritative cart in items_ar (which includes both your regulars AND the preserved combos for readback), plus rejected (items not on menu with suggestions) and corrected (items whose name/price was snapped). If rejected is non-empty, DO NOT confirm the order — ask the user to pick from suggestions. Always trust items_ar over your own memory when reading the cart back.",
                 parameters: {
                     type: "object",
                     properties: {
@@ -1341,6 +1360,11 @@ ${combosCatalogForPrompt()}
             useNativeDriver: true
         }).start();
 
+        // Build the validation index for this restaurant's menu so every
+        // subsequent update_cart call can snap AI-supplied items to canonical
+        // names + prices (see validateCartItems in handleUpdateCart).
+        menuIndexRef.current = buildMenuIndex(restaurant.menu_json);
+
         // Inject the full menu into the AI's instructions via session.update
         const updatedInstructions = getMenuInstructions(restaurant);
         socket.send(JSON.stringify({
@@ -1350,7 +1374,7 @@ ${combosCatalogForPrompt()}
             }
         }));
 
-        console.log(`[TOOL] Restaurant selected: ${restaurant.name_en}, menu injected with ${restaurant.menu_json.length} categories`);
+        console.log(`[TOOL] Restaurant selected: ${restaurant.name_en}, menu injected with ${restaurant.menu_json.length} categories, index has ${menuIndexRef.current.items.length} items`);
 
         // Return category summary so AI can respond naturally
         const categories = restaurant.menu_json.map((cat: any) => cat.category_ar).join('، ');
@@ -1368,14 +1392,70 @@ ${combosCatalogForPrompt()}
 
     // Handle update_cart — updates the visual cart widget
     const handleUpdateCart = (args: { items: CartItem[] }) => {
-        console.log(`[TOOL] update_cart: ${args.items.length} items`, args.items);
-        setCartItems(args.items || []);
-        const subtotal = (args.items || []).reduce((sum: number, item: CartItem) => sum + (item.unit_price * item.quantity), 0);
+        const rawItems = args.items || [];
+        console.log(`[TOOL] update_cart requested with ${rawItems.length} items`, rawItems);
+
+        // Preserve existing combo lines untouched — they have custom modifications
+        // baked into name/price from add_active_combo_to_cart. The AI shouldn't
+        // (and often can't reliably) re-send them with the right price, so we pull
+        // them out of the current cart and re-attach after validation.
+        const existingCombos = cartItemsRef.current.filter(i => i.is_combo);
+
+        // Drop any AI-sent lines that look like combos (defensive — if the AI sends
+        // a combo line in update_cart despite instructions, we ignore it since the
+        // existing combo state is already authoritative).
+        const incomingRegulars = rawItems.filter(i => !i.is_combo);
+
+        // Validate every AI-supplied regular item against the active restaurant's menu.
+        // Names get snapped to canonical spellings, prices snapped to real menu
+        // prices, and items that don't match anything on the menu are rejected.
+        const { items: validated, corrections, rejections } = validateCartItems(
+            incomingRegulars,
+            menuIndexRef.current,
+        );
+
+        // Final cart = preserved combos (with their modified prices) + validated regulars.
+        const mergedCart: CartItem[] = [...existingCombos, ...validated];
+        setCartItems(mergedCart);
+        cartItemsRef.current = mergedCart;
+
+        const subtotal = mergedCart.reduce((sum, item) => sum + item.unit_price * item.quantity, 0);
+
+        if (corrections.length > 0) {
+            console.log(`[TOOL] update_cart corrections:`, corrections);
+        }
+        if (rejections.length > 0) {
+            console.log(`[TOOL] update_cart rejections:`, rejections);
+        }
+
+        // Return a detailed result so the AI speaks from ground truth:
+        // - items_ar: canonical cart as it truly is in the UI now
+        // - rejected: items the AI tried to add that aren't on the menu
+        //   (with up to 3 closest-matching suggestions for repair prompts)
+        // - corrected: items whose name/price the AI had wrong
         return {
-            success: true,
-            items_count: args.items.length,
-            subtotal: subtotal,
-            message: `تم تحديث السلة. ${args.items.length} صنف، المجموع الفرعي: ${subtotal} ريال`
+            success: rejections.length === 0,
+            items_count: mergedCart.length,
+            subtotal,
+            items_ar: mergedCart.map(i => ({
+                name_ar: i.name_ar,
+                quantity: i.quantity,
+                unit_price: i.unit_price,
+                is_combo: !!i.is_combo,
+            })),
+            rejected: rejections.map(r => ({
+                requested: r.requested_name,
+                suggestions: r.suggestions_ar,
+            })),
+            corrected: corrections.map(c => ({
+                from: c.requested_name,
+                to: c.canonical_name_ar,
+                snapped_price: c.canonical_price,
+                reason: c.reason,
+            })),
+            message: rejections.length > 0
+                ? `تم تحديث السلة (${mergedCart.length} صنف). لكن ${rejections.length} صنف مش موجود في القائمة: ${rejections.map(r => r.requested_name).join('، ')}. اقترح بدائل على المستخدم وتأكد قبل المتابعة.`
+                : `تم تحديث السلة. ${mergedCart.length} صنف، المجموع الفرعي: ${subtotal} ريال.`,
         };
     };
 
@@ -1509,6 +1589,11 @@ ${combosCatalogForPrompt()}
             quantity: perCombo.quantity,
             unit_price: unitPrice,
             notes: undefined,
+            // Tag so update_cart preserves this line with its modified price intact
+            // instead of re-validating it against the base menu (which would snap
+            // the price back to the un-modified combo price).
+            is_combo: true,
+            combo_id: activeCombo.id,
         };
         setCartItems((prev) => [...prev, newItem]);
         comboStore.reset(activeCombo.id, activeCombo);

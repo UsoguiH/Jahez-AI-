@@ -9,6 +9,12 @@ export interface CartItem {
     quantity: number;
     unit_price: number;
     notes?: string;
+    // Combo lines are added via add_active_combo_to_cart with custom modifications
+    // baked into name + unit_price. They must NOT be revalidated against the base
+    // menu (that would snap the price back to the un-modified combo price) and
+    // are tracked separately from regular cart items in update_cart.
+    is_combo?: boolean;
+    combo_id?: string;
 }
 
 interface OrderCartWidgetProps {
