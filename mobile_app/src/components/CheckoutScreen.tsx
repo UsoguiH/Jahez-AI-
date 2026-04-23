@@ -1083,7 +1083,7 @@ const styles = StyleSheet.create({
         right: 0,
         paddingHorizontal: 14,
         paddingTop: 10,
-        paddingBottom: Platform.OS === 'ios' ? 34 : 16,
+        paddingBottom: Platform.OS === 'ios' ? 34 : 52,
         backgroundColor: '#fff',
         borderTopWidth: 1,
         borderTopColor: NEUTRAL_BORDER,

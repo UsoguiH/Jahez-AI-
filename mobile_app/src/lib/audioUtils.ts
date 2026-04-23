@@ -74,6 +74,49 @@ export const computeAmplitudeEnvelope = (pcmBase64: string, sampleRate = 24000, 
     });
 };
 
+// Downsample 24 kHz mono PCM16 to 16 kHz via linear interpolation.
+//
+// Gemini Live expects input audio at 16 kHz; our mic captures at 24 kHz (the
+// OpenAI Realtime format). Ratio is exactly 3:2 so every pair of output samples
+// consumes three input samples. Linear interpolation is indistinguishable from
+// higher-order filters for voice at this ratio and is ~10x cheaper — we run this
+// on every mic chunk (every ~85 ms), so cost matters.
+export const resamplePcm16_24kTo16k = (pcm24kBase64: string): string => {
+    const binary = global.atob(pcm24kBase64);
+    const inLen = binary.length;
+    const inSamples = Math.floor(inLen / 2);
+    if (inSamples === 0) return pcm24kBase64;
+
+    // Read Int16LE input
+    const input = new Int16Array(inSamples);
+    for (let i = 0; i < inSamples; i++) {
+        const lo = binary.charCodeAt(i * 2);
+        const hi = binary.charCodeAt(i * 2 + 1);
+        let s = (hi << 8) | lo;
+        if (s >= 0x8000) s -= 0x10000;
+        input[i] = s;
+    }
+
+    // Each output sample at index j maps to input index j * (24/16) = j * 1.5.
+    const outSamples = Math.floor(inSamples * 2 / 3);
+    const output = new Int16Array(outSamples);
+    for (let j = 0; j < outSamples; j++) {
+        const srcIdx = j * 1.5;
+        const i0 = Math.floor(srcIdx);
+        const i1 = Math.min(i0 + 1, inSamples - 1);
+        const t = srcIdx - i0;
+        output[j] = (input[i0] * (1 - t) + input[i1] * t) | 0;
+    }
+
+    // Write back as Int16LE string and re-encode to base64
+    let out = '';
+    for (let j = 0; j < outSamples; j++) {
+        const s = output[j] < 0 ? output[j] + 0x10000 : output[j];
+        out += String.fromCharCode(s & 0xff, (s >> 8) & 0xff);
+    }
+    return global.btoa(out);
+};
+
 export const appendWavHeader = (pcmBase64: string, sampleRate = 24000) => {
     // Decode base64 to binary string
     const binaryString = global.atob(pcmBase64);

@@ -20,6 +20,19 @@ import { ComboItem } from '../data/mcdonaldsCombo';
 import { findCombo, combosCatalogForPrompt } from '../data/combos';
 import ComboCard from './ComboCard';
 import { buildMenuIndex, validateCartItems, MenuIndex } from '../lib/cartValidator';
+import {
+    VOICE_PROVIDER,
+    sendSessionInstructions,
+    sendInitialGreeting,
+    sendInjectedUserText,
+    sendToolResult,
+    sendAudioChunk,
+    sendAudioCommit,
+    sendInterrupt,
+} from '../lib/voiceProtocol';
+// Hoisted from inside playAudioChunk — the dynamic import on first call was
+// costing ~50-100ms every time the AI started talking.
+import { appendWavHeader, computeAmplitudeEnvelope } from '../lib/audioUtils';
 
 // Polyfill for global
 if (!global.btoa) { global.btoa = btoa; }
@@ -76,6 +89,24 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
     const aiResponseInterruptedRef = useRef<boolean>(false);
     // Imperative handle to the visualizer so interrupt can snap it to the orb instantly.
     const visualizerRef = useRef<AIVisualizerHandle | null>(null);
+
+    // Pending setTimeout that flips isSpeaking off after the echo-tail grace period.
+    // Tracked as a ref so a new AI turn starting mid-grace can cancel it — otherwise
+    // the old timer fires inside the new turn and wrongly opens the mic.
+    const echoTailTimerRef = useRef<any>(null);
+
+    // --- Gemini streaming playback state ---
+    // Instead of buffering the entire AI turn before playing (which makes the user
+    // wait ~3-4s from "transcription appears" to "voice starts"), we play chunks as
+    // they arrive. inlineData base64 accumulates in streamingPendingRef until we hit
+    // the first-batch threshold, then we start playing. Subsequent audio that arrives
+    // during playback is drained and played immediately when the current chunk ends.
+    const streamingPendingRef = useRef<string>('');           // unplayed base64 PCM
+    const streamingBusyRef = useRef<boolean>(false);           // a chunk is playing now
+    const streamingTurnEndedRef = useRef<boolean>(false);      // turnComplete seen, no more chunks
+    // First batch threshold ≈ 400ms of 24kHz PCM16. Larger = smoother start/less
+    // under-run risk; smaller = snappier first-audio latency. 400ms is our sweet spot.
+    const STREAM_FIRST_BATCH_MIN_B64 = 12800;
 
     // Restaurant menu data — pre-loaded on mic open for zero latency
     const restaurantsRef = useRef<Restaurant[]>([]);
@@ -692,19 +723,10 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
         const audioEndMs = Math.max(0, Math.floor(playbackPositionMsRef.current));
 
         if (socket && socket.readyState === WebSocket.OPEN) {
-            // Cancel any in-flight generation (no-op if the model already finished)
-            try { socket.send(JSON.stringify({ type: 'response.cancel' })); } catch {}
-            // Truncate the assistant turn so the model's context reflects what the user heard
-            if (itemId) {
-                try {
-                    socket.send(JSON.stringify({
-                        type: 'conversation.item.truncate',
-                        item_id: itemId,
-                        content_index: 0,
-                        audio_end_ms: audioEndMs,
-                    }));
-                } catch {}
-            }
+            // Protocol helper routes to OpenAI cancel+truncate or Gemini activityStart
+            // depending on VOICE_PROVIDER. Gemini auto-handles truncation server-side;
+            // OpenAI needs explicit item_id + audio_end_ms to match what the user heard.
+            sendInterrupt(socket, itemId, audioEndMs);
         }
 
         currentResponseItemIdRef.current = null;
@@ -822,7 +844,15 @@ ${combosCatalogForPrompt()}
 - لا تذكر أي IDs أو معلومات تقنية.
 - الأسعار بالريال السعودي.
 - ردودك قصيرة جداً — جملة أو جملتين فقط.
-- لا تسرد جميع المطاعم أبداً. فقط اقترح ٢-٣ مطاعم حسب ما يشتهيه المستخدم.`;
+- لا تسرد جميع المطاعم أبداً. فقط اقترح ٢-٣ مطاعم حسب ما يشتهيه المستخدم.
+
+**قواعد استعمال نتائج الأدوات — صارمة وإلزامية:**
+0. **ترتيب الإجابة (مهم جداً):** لما المستخدم يطلب تغيير على السلة (إضافة، حذف، زيادة كمية)، استدعِ الأداة المناسبة (update_cart أو open_combo_customizer أو customize_combo) **قبل** ما تقول أي جملة صوتية. الأداة أولاً، ثم التأكيد الصوتي. لو تكلمت قبل الأداة، الواجهة ما تتحدث إلا بعد ما تخلص كلامك — والمستخدم يحس إن الـ AI يقول "تمام" والسلة ما تغيّرت.
+1. **select_restaurant يرجّع حقل "menu"** فيه كل الأصناف والأسعار الحقيقية للمطعم المختار. **هذي القائمة هي مصدر الحقيقة الوحيد عندك.** لا تخترع صنف مش موجود فيها. لا تخترع سعر مختلف عن السعر المكتوب. إذا المستخدم طلب صنف، دوّره في "menu" أولاً قبل ما تؤكد.
+2. **update_cart يرجّع حقل "items_ar"** فيه الأصناف كما هي فعلاً في سلة المستخدم الآن (بعد التصحيح من النظام). **اعتمد عليه، مش على ذاكرتك.** items_count > 0 معناه السلة فيها أصناف — لا تقول "السلة فاضية".
+3. **إذا update_cart يرجّع "corrected" (أصناف تم تصحيح أسعارها):** هذا معناه **أنت** استعملت سعر غلط والنظام صحّحه للسعر الحقيقي من القائمة. **لا تقل "الأسعار تغيرت" ولا تعتذر — السعر الصحيح هو اللي في القائمة أصلاً.** فقط أكّد الاسم والسعر الصحيح مرة وحدة للمستخدم.
+4. **إذا update_cart يرجّع "rejected" (أصناف مرفوضة):** الصنف مش موجود في القائمة. اقترح أقرب بديل من "suggestions" الموجودة في نفس الرد.
+5. **ممنوع تسأل المستخدم "كم سعره تتوقعه؟"** — أنت عندك السعر من "menu". السعر غير قابل للتفاوض ولا للتخمين.`;
     };
 
     // Build combo-mode instructions (when user opens voice from a ComboCard)
@@ -925,7 +955,8 @@ ${combosCatalogForPrompt()}
 **المهام:**
 1. ساعد المستخدم في اختيار أصناف من القائمة.
 2. لما يطلب صنف، أكّد الاسم والسعر بجملة وحدة.
-3. **مهم جداً:** بعد كل إضافة أو تعديل أو حذف صنف عادي (غير الوجبات)، استخدم أداة update_cart فوراً وأرسل **الأصناف العادية فقط** (بدون الوجبات/الكومبو) مع الكميات والأسعار. **لا ترسل أبداً أي سطر كومبو في update_cart** — الوجبات التي تمت إضافتها عبر add_active_combo_to_cart محفوظة تلقائياً في السلة بسعرها المعدّل، ولو أرسلتها في update_cart سيُستبدل سعرها بالسعر الأساسي ويحصل خطأ.
+3. **مهم جداً — ترتيب إجباري:** لما المستخدم يذكر أصناف يبيها، **استدعِ update_cart أولاً قبل ما تتكلم أي حرف**. الأمر الصوتي يطلع بعد ما الأداة ترجّع، مش قبل. مطعم → أدواتك أولاً → ثم صوتك. لو تكلمت قبل update_cart، المستخدم يشوف السلة فاضية وأنت تأكد — وهذا أسوأ شي.
+3.0. بعد كل إضافة أو تعديل أو حذف صنف عادي (غير الوجبات)، استخدم أداة update_cart **فوراً وقبل الرد الصوتي** وأرسل **الأصناف العادية فقط** (بدون الوجبات/الكومبو) مع الكميات والأسعار. **لا ترسل أبداً أي سطر كومبو في update_cart** — الوجبات التي تمت إضافتها عبر add_active_combo_to_cart محفوظة تلقائياً في السلة بسعرها المعدّل، ولو أرسلتها في update_cart سيُستبدل سعرها بالسعر الأساسي ويحصل خطأ.
 3.1. **قاعدة open_combo_customizer (صارمة):** استخدمها **فقط** للأصناف المدرجة حرفياً بـ combo_id في قسم "الوجبات (Combos) المتاحة للتخصيص بالصوت" أعلاه (حالياً فقط mcd_big_mac_meal). **أي صنف آخر في القائمة — حتى لو كان في قسم "وجبات وساندويتشات" أو يحتوي كلمة "وجبة" في اسمه — استخدم update_cart بشكل طبيعي.** أمثلة: "٩ قطع ماك ناجتس" → update_cart. "بيج ماك ساندويتش فقط" → update_cart. "وجبة بيج ماك" → open_combo_customizer. بعد فتح البطاقة، استخدم customize_combo لكل اختيار، وأخيراً add_active_combo_to_cart للتأكيد.
 3.2. **تحذير:** لا تخترع combo_id. إذا لم تجد الصنف حرفياً في قائمة الـ Combos أعلاه، استخدم update_cart.
 4. لما يقول "أكد" أو "خلاص" أو "تمم" أو "بس كذا"، استخدم confirm_order واذكر ملخص الطلب والمجموع.
@@ -1262,12 +1293,8 @@ ${combosCatalogForPrompt()}
                             result = { error: `Unknown tool: ${name}` };
                         }
 
-                        // Send tool result back
-                        socket.send(JSON.stringify({
-                            type: 'conversation.item.create',
-                            item: { type: 'function_call_output', call_id: callId, output: JSON.stringify(result) }
-                        }));
-                        socket.send(JSON.stringify({ type: 'response.create' }));
+                        // Protocol helper sends the right shape for whichever provider.
+                        sendToolResult(socket, callId, name, result);
                     }
 
                 } catch (e) {
@@ -1292,6 +1319,498 @@ ${combosCatalogForPrompt()}
             console.error('Connection failed', e);
             setStatus(`Failed: ${e?.message || 'Unknown error'}`);
         }
+    };
+
+    // ========================================================================
+    // Gemini 3.1 Flash Live connection — native speech-to-speech, 16 kHz input.
+    // Same tool handlers and UI state as the OpenAI path; only the wire protocol
+    // differs. Flip VOICE_PROVIDER in voiceProtocol.ts to switch between them.
+    // ========================================================================
+    const connectToGeminiLive = async (authToken: string) => {
+        if (ws.current) return;
+
+        // Gemini function declarations — same schemas as OpenAI tools but stripped
+        // of the `type: 'function'` wrapper and grouped under functionDeclarations.
+        // Type names MUST be UPPERCASE (STRING, OBJECT, ARRAY, NUMBER) per Gemini's
+        // OpenAPI-subset schema. Lowercase values are silently rejected and the
+        // Live endpoint closes with code 1011 "Internal error encountered".
+        const functionDeclarations = [
+            {
+                name: 'select_restaurant',
+                description: "Select a restaurant to order from. Call this when the user says which restaurant they want.",
+                parameters: {
+                    type: 'OBJECT',
+                    properties: {
+                        restaurant_name: {
+                            type: 'STRING',
+                            description: "The name of the restaurant the user wants (e.g., 'البيك', 'الرومانسية', 'ماكدونالدز', 'شاورمر', 'كودو', 'هرفي', 'بيتزا هت', 'ماما نورة', 'الطازج', 'باسكن روبنز', 'كنتاكي', 'صب واي', 'ستاربكس')",
+                        },
+                    },
+                    required: ['restaurant_name'],
+                },
+            },
+            {
+                name: 'update_cart',
+                description: "Update the visual cart on the user's screen for REGULAR menu items only (not combos/meals). CALL THIS IMMEDIATELY the moment the user names items they want — BEFORE you speak your confirmation, not after. The cart UI only appears after this call returns, so any delay between the user's request and this call is visible as 'the AI said yes but nothing happened'. Send the full current list of regular items each call — do NOT include combo/meal lines here; those are managed separately via add_active_combo_to_cart and preserved automatically with their modified prices. If you include a combo line here, its modifications/price will be lost. The system validates every regular item against the real menu and returns the authoritative cart in items_ar (which includes both your regulars AND the preserved combos for readback), plus rejected (items not on menu with suggestions) and corrected (items whose name/price was snapped). If rejected is non-empty, DO NOT confirm the order — ask the user to pick from suggestions. Always trust items_ar over your own memory when reading the cart back.",
+                parameters: {
+                    type: 'OBJECT',
+                    properties: {
+                        items: {
+                            type: 'ARRAY',
+                            description: "The complete list of all items currently in the order",
+                            items: {
+                                type: 'OBJECT',
+                                properties: {
+                                    name_ar: { type: 'STRING', description: "Arabic name of the item" },
+                                    name_en: { type: 'STRING', description: "English name of the item" },
+                                    quantity: { type: 'NUMBER', description: "Quantity ordered" },
+                                    unit_price: { type: 'NUMBER', description: "Price per unit in SAR" },
+                                    notes: { type: 'STRING', description: "Optional customization notes, e.g. 'بدون مخلل' or 'إضافة جبنة'" },
+                                },
+                                required: ['name_ar', 'name_en', 'quantity', 'unit_price'],
+                            },
+                        },
+                    },
+                    required: ['items'],
+                },
+            },
+            {
+                name: 'confirm_order',
+                description: "Confirm and place the user's order. Call this when the user says they want to confirm/finalize their order.",
+                parameters: {
+                    type: 'OBJECT',
+                    properties: {
+                        order_summary: { type: 'STRING', description: "A summary of what the user ordered, e.g., 'وجبة قطعتين بروست × 1، روبيان ٦ قطع × 2'" },
+                        total_price: { type: 'NUMBER', description: "The total price in SAR" },
+                    },
+                    required: ['order_summary', 'total_price'],
+                },
+            },
+            {
+                name: 'suggest_restaurants',
+                description: "Show restaurant card suggestions visually on the user's screen based on cuisine preference. Call this IMMEDIATELY when the user mentions a food type like burger, pizza, chicken, shawarma, coffee, dessert, sandwich, or Saudi food.",
+                parameters: {
+                    type: 'OBJECT',
+                    properties: {
+                        cuisine: { type: 'STRING', description: "The cuisine type in Arabic, e.g., 'برجر', 'بيتزا', 'دجاج', 'شاورما', 'قهوة', 'حلا', 'ساندوتش', 'أكل سعودي'" },
+                    },
+                    required: ['cuisine'],
+                },
+            },
+            {
+                name: 'open_combo_customizer',
+                description: "Open the voice customization card ONLY for combos that appear in the combo catalog in your instructions (currently only 'mcd_big_mac_meal'). Do NOT call this for regular menu items, even if they are inside a restaurant category named 'وجبات' or contain the word 'وجبة' in their name (e.g. '9 Piece Chicken McNuggets' is a regular item — use update_cart). Do NOT invent combo_ids. If the item is not literally listed as a combo with an explicit combo_id, use update_cart instead.",
+                parameters: {
+                    type: 'OBJECT',
+                    properties: {
+                        combo_id: { type: 'STRING', description: "The id of the combo to open, exactly as listed in the combo catalog (e.g. 'mcd_big_mac_meal'). You can also pass the Arabic or English name and the system will fuzzy-match." },
+                    },
+                    required: ['combo_id'],
+                },
+            },
+            {
+                name: 'customize_combo',
+                description: "Update a selection on the currently active combo card visible on the user's screen. Call this IMMEDIATELY when the user says a modifier (size, fries type, drink, add-on, or remove). Never wait — call it at the same time you speak the confirmation.",
+                parameters: {
+                    type: 'OBJECT',
+                    properties: {
+                        group_id: { type: 'STRING', description: "The modifier group id exactly as listed in the combo details (e.g. 'size', 'fries', 'drink', 'extras', 'remove')." },
+                        option_ids: { type: 'ARRAY', description: "Array of option ids to apply (e.g. ['size_l'], ['extra_cheese','extra_bacon']). Use ids from the combo details, not Arabic names.", items: { type: 'STRING' } },
+                        action: { type: 'STRING', enum: ['set', 'add', 'remove', 'clear'], description: "'set' replaces the group's selection (for single-select groups). 'add' appends (for extras/remove). 'remove' removes the listed ids. 'clear' empties the group." },
+                    },
+                    required: ['group_id', 'option_ids', 'action'],
+                },
+            },
+            {
+                name: 'add_active_combo_to_cart',
+                description: "Finalize the currently active combo with its current selections and add it to the cart. Call this when the user confirms (says 'خلاص', 'أكد', 'تمم', 'أضف'). Will fail if required groups are still unfilled.",
+                parameters: { type: 'OBJECT', properties: {}, required: [] },
+            },
+        ];
+
+        try {
+            console.log('Fetching Gemini ephemeral token...');
+            setStatus('Connecting...');
+
+            const { data, error } = await supabase.functions.invoke('gemini-live-proxy', {
+                method: 'POST',
+                headers: {
+                    ...(authToken && authToken !== 'guest-demo-token' ? { Authorization: `Bearer ${authToken}` } : {}),
+                },
+            });
+
+            if (error) {
+                console.error("Gemini token fetch error:", error);
+                throw new Error(`Failed to get Gemini access token: ${error.message}`);
+            }
+
+            const accessToken = data?.access_token;
+            if (!accessToken) {
+                console.error("No access_token in data:", data);
+                throw new Error('No Gemini access token returned');
+            }
+
+            console.log('Got Gemini token, connecting to Gemini Live...');
+            console.log('[GEMINI] token prefix:', accessToken.slice(0, 20) + '...');
+
+            // v1alpha Constrained endpoint for ephemeral-token auth. The token was
+            // minted server-side with the model locked to 3.1-flash-live-preview,
+            // so a leaked client token can't be re-pointed at a more expensive model.
+            const url = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContentConstrained?access_token=${encodeURIComponent(accessToken)}`;
+            console.log('[GEMINI] WS url (masked):', url.replace(/access_token=[^&]+/, 'access_token=***'));
+
+            // @ts-ignore
+            const socket = new WebSocket(url);
+            // Gemini sends JSON as binary frames. Request raw bytes so we can
+            // TextDecoder them directly — RN's default 'blob' path has spotty
+            // .text() support across versions.
+            try { (socket as any).binaryType = 'arraybuffer'; } catch {}
+
+            // Per-session accumulators — Gemini streams input/output transcripts
+            // in pieces and commits only on turnComplete. We hold them here so
+            // multiple socket.onmessage calls can concatenate before we push to
+            // the UI, and so we can read the final text without needing a React
+            // ref (which would require a setState-inside-setState anti-pattern).
+            let geminiInputTranscript = '';
+            let geminiOutputTranscript = '';
+
+            // Watchdog: if we never hear setupComplete from the server, we're
+            // either blocked (bad setup rejected silently) or the endpoint closed
+            // without a clean onclose. Surface it loudly so it's debuggable.
+            let setupCompleted = false;
+            const setupWatchdog = setTimeout(() => {
+                if (!setupCompleted) {
+                    console.error('[GEMINI] WATCHDOG: no setupComplete after 10s — server likely rejected setup silently. Socket state:', socket.readyState);
+                    setStatus('Setup timeout — no setupComplete');
+                }
+            }, 10000);
+
+            socket.onopen = () => {
+                console.log('[GEMINI] socket.onopen — WebSocket handshake succeeded');
+                setIsConnected(true);
+                setStatus('Connected, sending setup...');
+
+                const activeCombo = comboStore.getState().activeCombo;
+                const instructions = activeCombo
+                    ? getComboInstructions(activeCombo)
+                    : getInitialInstructions();
+                const greeting = activeCombo
+                    ? `رحّب بالمستخدم كلمتين فقط ("هلا!" أو "أبشر!") ثم اسأله على طول عن ${activeCombo.groups.find((g) => g.required)?.title_ar || 'الحجم'}. جملة واحدة قصيرة.`
+                    : `رحّب بالمستخدم ترحيب حار وقصير وعرّف عن نفسك إنك "جاهز AI" واسأله وش يشتهي اليوم — برقر، دجاج، شاورما، بيتزا، أو قهوة؟ جملتين فقط لا تطوّل. لا تذكر أسماء مطاعم.`;
+
+                // Setup message — locks audio modality, enables transcription both ways,
+                // tunes VAD to match OpenAI's server_vad thresholds for consistent barge-in feel.
+                // IMPORTANT: the edge function mints tokens WITHOUT bidiGenerateContentSetup,
+                // because locking even just `model` in the token causes the server to 1011
+                // on the client's subsequent setup frame.
+                const setupMsg = {
+                    setup: {
+                        // Switched from gemini-3.1-flash-live-preview — it accepted setup
+                        // + greeting + audio but produced NO serverContent frames (only
+                        // sessionResumptionUpdate heartbeats) and eventually closed with
+                        // 1011 "Resource has been exhausted". Strong indication that 3.1
+                        // preview isn't generally available for our project tier.
+                        // The 2.5-native-audio preview is broadly accessible and supports
+                        // transcription + function tools.
+                        model: 'models/gemini-2.5-flash-native-audio-preview-12-2025',
+                        generationConfig: {
+                            responseModalities: ['AUDIO'],
+                            speechConfig: {
+                                voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } },
+                                languageCode: 'ar-EG',
+                            },
+                            // Disable thinking. On 2.5 native-audio, the default thinking
+                            // budget makes the model emit internal-reasoning text parts
+                            // ("**Crafting The Welcome**...") for 1–2s before any audio
+                            // tokens stream. thinkingBudget=0 skips that phase entirely —
+                            // response audio starts almost immediately after turnComplete.
+                            thinkingConfig: { thinkingBudget: 0 },
+                        },
+                        // Shorten end-of-turn silence detection. The default auto-VAD
+                        // waits ~1000ms of silence before committing the user turn; 400ms
+                        // is the sweet spot for Saudi colloquial pacing (frequent short
+                        // pauses) without cutting the user off mid-sentence.
+                        realtimeInputConfig: {
+                            automaticActivityDetection: {
+                                silenceDurationMs: 400,
+                            },
+                        },
+                        systemInstruction: { parts: [{ text: instructions }] },
+                        tools: [{ functionDeclarations }],
+                        // Transcription both ways — parity with the OpenAI path.
+                        // Empty objects are the "enable with defaults" signal on 2.5
+                        // native-audio. Server emits serverContent.inputTranscription
+                        // and serverContent.outputTranscription deltas during the turn.
+                        inputAudioTranscription: {},
+                        outputAudioTranscription: {},
+                    },
+                };
+                const setupJson = JSON.stringify(setupMsg);
+                console.log('[GEMINI] sending setup, size=', setupJson.length, 'tools=', functionDeclarations.length);
+                socket.send(setupJson);
+
+                // Stash greeting on the socket so onmessage can trigger it after setupComplete.
+                // The spec says the server sends setupComplete before we can send any content —
+                // firing a greeting before that arrives gets dropped silently. Same for mic audio.
+                (socket as any)._pendingGreeting = greeting;
+                (socket as any)._pendingMode = activeCombo ? 'combo:' + activeCombo.id : 'restaurant-picker';
+            };
+
+            socket.onmessage = async (event) => {
+                try {
+                    // Gemini Live delivers JSON as binary frames. RN's WebSocket gives us
+                    // one of: string (some envs), ArrayBuffer, Blob with .text(), or a Blob
+                    // stub without .text(). Handle all four and FileReader-fallback for the
+                    // stub case so we don't drop the first frame (which is setupComplete).
+                    const data: any = event.data;
+                    let raw: string;
+                    if (typeof data === 'string') {
+                        raw = data;
+                    } else if (data instanceof ArrayBuffer) {
+                        raw = new TextDecoder('utf-8').decode(new Uint8Array(data));
+                    } else if (data && typeof data.text === 'function') {
+                        raw = await data.text();
+                    } else if (data && typeof data.arrayBuffer === 'function') {
+                        const buf = await data.arrayBuffer();
+                        raw = new TextDecoder('utf-8').decode(new Uint8Array(buf));
+                    } else {
+                        // Last resort: FileReader path for older RN Blob shims.
+                        raw = await new Promise<string>((resolve, reject) => {
+                            const r = new FileReader();
+                            r.onload = () => resolve(String(r.result));
+                            r.onerror = () => reject(r.error);
+                            r.readAsText(data);
+                        });
+                    }
+
+                    // Diagnostic: log truncated single-line preview of EVERY incoming
+                    // frame. Strip newlines+whitespace so RN's console doesn't clip at \n.
+                    // (Remove once audio path is confirmed.)
+                    console.log('[GEMINI] frame:', raw.replace(/\s+/g, ' ').slice(0, 250));
+
+                    const msg = JSON.parse(raw);
+
+                    if (msg.setupComplete) {
+                        console.log('[GEMINI] setupComplete received');
+                        setupCompleted = true;
+                        clearTimeout(setupWatchdog);
+                        setStatus('Ready');
+
+                        const greeting = (socket as any)._pendingGreeting;
+                        const mode = (socket as any)._pendingMode;
+                        if (greeting) {
+                            console.log(`[GEMINI] requesting greeting, mode=${mode}`);
+                            sendInitialGreeting(socket, greeting);
+                        }
+                        setTimeout(() => {
+                            console.log('[GEMINI] starting mic recording');
+                            startRecording();
+                        }, 1500);
+                    }
+
+                    if (msg.error) {
+                        console.error("[GEMINI] server error frame:", JSON.stringify(msg, null, 2));
+                        setStatus(`Server error: ${msg.error?.message || 'see logs'}`);
+                    }
+
+                    if (msg.serverContent) {
+                        const sc = msg.serverContent;
+
+                        // User barge-in — server detected interrupt via VAD. Arm the
+                        // local guard so any straggler audio chunks get dropped and
+                        // stop any in-flight playback. Mirrors OpenAI interrupt path.
+                        if (sc.interrupted) {
+                            console.log('[GEMINI] Server-detected user interrupt');
+                            aiResponseInterruptedRef.current = true;
+                            audioBuffer.current = '';
+                            // Clear any streaming-playback state so the recursive
+                            // didJustFinish chain exits instead of continuing to
+                            // drain buffered audio that the user just talked over.
+                            streamingPendingRef.current = '';
+                            streamingTurnEndedRef.current = false;
+                            streamingBusyRef.current = false;
+                            const sound = currentSound.current;
+                            if (sound) {
+                                try { sound.setOnPlaybackStatusUpdate(null); } catch {}
+                                try { await sound.stopAsync(); } catch {}
+                                try { await sound.unloadAsync(); } catch {}
+                                if (currentSound.current === sound) currentSound.current = null;
+                            }
+                            visualizerRef.current?.forceListen();
+                            isSpeaking.current = false;
+                            setIsAiSpeaking(false);
+                        }
+
+                        // Incremental ASR of user speech — accumulate until turnComplete.
+                        if (sc.inputTranscription?.text) {
+                            geminiInputTranscript += sc.inputTranscription.text;
+                        }
+
+                        // Incremental text of AI's spoken output — drive the live caption.
+                        if (sc.outputTranscription?.text) {
+                            geminiOutputTranscript += sc.outputTranscription.text;
+                            setCurrentAiText(geminiOutputTranscript);
+                        }
+
+                        // Audio chunks from the model. inlineData.data is base64 PCM16 @ 24 kHz.
+                        // Stream-play: accumulate into streamingPendingRef, and once we
+                        // have ~400ms buffered, kick off playPendingStreamAudio which
+                        // keeps the pipe full until turnComplete. audioBuffer.current is
+                        // retained purely as a "first-chunk-of-turn" marker for arming
+                        // isSpeaking/clearing the interrupt flag.
+                        if (sc.modelTurn?.parts && !aiResponseInterruptedRef.current) {
+                            for (const part of sc.modelTurn.parts) {
+                                if (part.inlineData?.data) {
+                                    if (audioBuffer.current.length === 0) {
+                                        aiResponseInterruptedRef.current = false;
+                                        isSpeaking.current = true;
+                                        setIsAiSpeaking(true);
+                                        // Cancel any stale echo-tail timer left over from
+                                        // the PREVIOUS turn — otherwise it fires inside
+                                        // THIS turn and wrongly opens the mic to echo.
+                                        if (echoTailTimerRef.current) {
+                                            clearTimeout(echoTailTimerRef.current);
+                                            echoTailTimerRef.current = null;
+                                        }
+                                    }
+                                    audioBuffer.current += part.inlineData.data;
+                                    streamingPendingRef.current += part.inlineData.data;
+                                    // Start playback as soon as first batch threshold is
+                                    // met. Subsequent chunks are picked up automatically
+                                    // by the recursive playPendingStreamAudio chain.
+                                    if (!streamingBusyRef.current
+                                        && streamingPendingRef.current.length >= STREAM_FIRST_BATCH_MIN_B64) {
+                                        playPendingStreamAudio();
+                                    }
+                                }
+                            }
+                        }
+
+                        // End of model turn — commit transcripts and play buffered audio.
+                        if (sc.turnComplete) {
+                            console.log('[GEMINI] turnComplete, audio buffer length:', audioBuffer.current.length);
+
+                            if (geminiInputTranscript.trim()) {
+                                const finalUserText = geminiInputTranscript.trim();
+                                setMessages(prev => [...prev, { role: 'user', text: finalUserText }]);
+                                geminiInputTranscript = '';
+                            }
+
+                            // Flush accumulated AI caption into the message log.
+                            if (geminiOutputTranscript.trim()) {
+                                const finalAiText = geminiOutputTranscript.trim();
+                                setMessages(prev => [...prev, { role: 'ai', text: finalAiText }]);
+                                geminiOutputTranscript = '';
+                            }
+                            setCurrentAiText('');
+
+                            if (aiResponseInterruptedRef.current) {
+                                // Interrupted mid-turn — drop everything, don't play.
+                                audioBuffer.current = '';
+                                streamingPendingRef.current = '';
+                                streamingTurnEndedRef.current = false;
+                            } else {
+                                // Tell the streaming pipeline no more chunks are coming.
+                                // If a chunk is currently playing, the recursive
+                                // didJustFinish chain will drain the rest naturally.
+                                // If nothing is playing yet (e.g. short turn under first-
+                                // batch threshold, or tool-call turn with zero audio),
+                                // kick it so the pending buffer flushes and echo-tail arms.
+                                streamingTurnEndedRef.current = true;
+                                audioBuffer.current = '';
+                                if (!streamingBusyRef.current) {
+                                    playPendingStreamAudio();
+                                }
+                            }
+                            // Arm fresh state for the NEXT turn. Without this, a single
+                            // false-interrupt (e.g. speaker echo tripping server VAD)
+                            // leaves the flag stuck true and every subsequent AI turn
+                            // gets its audio dropped at the gate below.
+                            aiResponseInterruptedRef.current = false;
+                        }
+                    }
+
+                    // Tool calls — run handlers locally, send results back via helper.
+                    if (msg.toolCall?.functionCalls) {
+                        for (const fc of msg.toolCall.functionCalls) {
+                            const { id, name, args } = fc;
+                            console.log(`[TOOL] ${name} called with:`, args);
+
+                            let result: any;
+                            if (name === 'select_restaurant') {
+                                result = handleSelectRestaurant(args.restaurant_name, socket);
+                            } else if (name === 'suggest_restaurants') {
+                                result = handleSuggestRestaurants(args.cuisine);
+                            } else if (name === 'update_cart') {
+                                result = handleUpdateCart(args);
+                            } else if (name === 'confirm_order') {
+                                result = handleConfirmOrder(args);
+                            } else if (name === 'open_combo_customizer') {
+                                result = handleOpenComboCustomizer(args, socket);
+                            } else if (name === 'customize_combo') {
+                                result = handleCustomizeCombo(args);
+                            } else if (name === 'add_active_combo_to_cart') {
+                                result = handleAddActiveComboToCart(socket);
+                            } else {
+                                result = { error: `Unknown tool: ${name}` };
+                            }
+
+                            sendToolResult(socket, id, name, result);
+                        }
+                    }
+
+                    // Gemini may emit tool-call cancellations; nothing to do client-side
+                    // since we execute synchronously and send the response immediately.
+                    if (msg.toolCallCancellation) {
+                        console.log('[GEMINI] toolCallCancellation:', msg.toolCallCancellation);
+                    }
+
+                } catch (e) {
+                    console.error('Error parsing Gemini msg', e);
+                }
+            };
+
+            socket.onerror = (e: any) => {
+                // RN WebSocket 'error' events carry very little info — just dump
+                // everything enumerable so we can at least see the message.
+                const details = {
+                    message: e?.message,
+                    type: e?.type,
+                    code: e?.code,
+                    reason: e?.reason,
+                    isTrusted: e?.isTrusted,
+                };
+                console.error('[GEMINI] socket.onerror', JSON.stringify(details));
+                setStatus(`WS Error: ${e?.message || 'see logs'}`);
+            };
+
+            socket.onclose = (e) => {
+                clearTimeout(setupWatchdog);
+                // Close codes we care about:
+                // 1000 = normal; 1006 = abnormal (no close frame — usually TLS/DNS/auth reject before handshake);
+                // 1008 = policy violation (bad token/scope); 1011 = server error.
+                console.log('[GEMINI] socket.onclose', {
+                    code: e.code,
+                    reason: e.reason,
+                    wasClean: (e as any).wasClean,
+                    setupCompleted,
+                });
+                setIsConnected(false);
+                setStatus(e.code === 1000 ? 'Disconnected' : `Closed ${e.code}${e.reason ? ': ' + e.reason : ''}`);
+            };
+
+            ws.current = socket;
+
+        } catch (e: any) {
+            console.error('Gemini connection failed', e);
+            setStatus(`Failed: ${e?.message || 'Unknown error'}`);
+        }
+    };
+
+    // Dispatcher — picks the right provider based on voiceProtocol.VOICE_PROVIDER.
+    const connectVoiceSession = (authToken: string) => {
+        if (VOICE_PROVIDER === 'gemini') return connectToGeminiLive(authToken);
+        return connectToOpenAIDirectly(authToken);
     };
 
     // Handle select_restaurant tool call — instant since menus are pre-loaded
@@ -1365,14 +1884,15 @@ ${combosCatalogForPrompt()}
         // names + prices (see validateCartItems in handleUpdateCart).
         menuIndexRef.current = buildMenuIndex(restaurant.menu_json);
 
-        // Inject the full menu into the AI's instructions via session.update
+        // Inject the full menu into the AI's instructions — protocol helper
+        // handles OpenAI session.update vs Gemini clientContent injection.
+        // NOTE on Gemini native-audio: clientContent injection is unreliable —
+        // the model treats it as stray text rather than authoritative context,
+        // which was causing menu/price hallucinations (see tool response below
+        // for the real fix). We still fire this for OpenAI parity and as a
+        // best-effort secondary channel on Gemini.
         const updatedInstructions = getMenuInstructions(restaurant);
-        socket.send(JSON.stringify({
-            type: 'session.update',
-            session: {
-                instructions: updatedInstructions,
-            }
-        }));
+        sendSessionInstructions(socket, updatedInstructions);
 
         console.log(`[TOOL] Restaurant selected: ${restaurant.name_en}, menu injected with ${restaurant.menu_json.length} categories, index has ${menuIndexRef.current.items.length} items`);
 
@@ -1380,13 +1900,32 @@ ${combosCatalogForPrompt()}
         const categories = restaurant.menu_json.map((cat: any) => cat.category_ar).join('، ');
         const totalItems = restaurant.menu_json.reduce((sum: number, cat: any) => sum + cat.items.length, 0);
 
+        // Pack the entire menu (per-category, per-item with canonical name + price
+        // + availability) into the tool response. Tool responses are reliably part
+        // of the model's context on Gemini Live, unlike clientContent injections.
+        // This is the primary channel for menu grounding.
+        const menuByCategory = restaurant.menu_json.map((cat: any) => ({
+            category_ar: cat.category_ar,
+            category_en: cat.category_en,
+            items: (cat.items || [])
+                .filter((it: any) => it.available !== false)
+                .map((it: any) => ({
+                    name_ar: it.name_ar,
+                    name_en: it.name_en,
+                    price: it.price,
+                    description_ar: it.description_ar,
+                })),
+        }));
+
         return {
             success: true,
             restaurant_name_ar: restaurant.name_ar,
             restaurant_name_en: restaurant.name_en,
+            restaurant_context: restaurant.ai_voice_context,
             categories: categories,
             total_items: totalItems,
-            message: `تم اختيار ${restaurant.name_ar}. الأقسام المتاحة: ${categories}`
+            menu: menuByCategory,
+            message: `تم اختيار ${restaurant.name_ar}. القائمة الكاملة مرفقة في حقل "menu" — استعملها كمرجع الأسعار والأصناف. لا تخترع أي سعر أو صنف غير موجود في هذه القائمة.`,
         };
     };
 
@@ -1472,12 +2011,7 @@ ${combosCatalogForPrompt()}
         comboStore.setActive(combo);
 
         // Switch AI instructions into combo-customization mode so it knows group/option IDs
-        socket.send(JSON.stringify({
-            type: 'session.update',
-            session: {
-                instructions: getComboInstructions(combo),
-            },
-        }));
+        sendSessionInstructions(socket, getComboInstructions(combo));
 
         console.log(`[TOOL] open_combo_customizer: opened "${combo.name_ar}" (${combo.id})`);
 
@@ -1606,10 +2140,7 @@ ${combosCatalogForPrompt()}
         const restored = selectedRestaurantRef.current
             ? getMenuInstructions(selectedRestaurantRef.current)
             : getInitialInstructions();
-        socket.send(JSON.stringify({
-            type: 'session.update',
-            session: { instructions: restored },
-        }));
+        sendSessionInstructions(socket, restored);
 
         console.log(`[TOOL] add_active_combo_to_cart: +${summaryAr} × ${perCombo.quantity} = ${lineTotal} ر.س — combo card closed, instructions restored`);
 
@@ -1670,11 +2201,85 @@ ${combosCatalogForPrompt()}
         setSuggestedRestaurants([]);
         setMessages(prev => [...prev, { role: 'user', text: `اخترت ${restaurantNameAr}` }]);
         if (ws.current && ws.current.readyState === WebSocket.OPEN) {
-            ws.current.send(JSON.stringify({
-                type: 'conversation.item.create',
-                item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: `اخترت ${restaurantNameAr}` }] }
-            }));
-            ws.current.send(JSON.stringify({ type: 'response.create' }));
+            sendInjectedUserText(ws.current, `اخترت ${restaurantNameAr}`);
+        }
+    };
+
+    // Streaming playback for Gemini: drains streamingPendingRef as a fresh WAV,
+    // plays it, and on finish recursively plays whatever else accumulated during
+    // that playback. When the queue empties and the turn has ended, arms the
+    // echo-tail timer so isSpeaking flips off (same grace logic as playAudioChunk).
+    const playPendingStreamAudio = async () => {
+        if (streamingBusyRef.current) return;
+        if (aiResponseInterruptedRef.current) {
+            streamingPendingRef.current = '';
+            return;
+        }
+        if (streamingPendingRef.current.length === 0) {
+            // Nothing queued. If the turn is over, arm the echo-tail grace period
+            // so the mic re-opens AFTER the device speaker's tail has decayed.
+            if (streamingTurnEndedRef.current) {
+                streamingTurnEndedRef.current = false;
+                if (echoTailTimerRef.current) clearTimeout(echoTailTimerRef.current);
+                echoTailTimerRef.current = setTimeout(() => {
+                    echoTailTimerRef.current = null;
+                    console.log('Streaming finished (echo-tail elapsed) — resuming mic');
+                    isSpeaking.current = false;
+                    setIsAiSpeaking(false);
+                }, 600);
+            }
+            return;
+        }
+
+        const batch = streamingPendingRef.current;
+        streamingPendingRef.current = '';
+        streamingBusyRef.current = true;
+
+        try {
+            const envelope = computeAmplitudeEnvelope(batch, 24000, 30);
+            const envelopeFps = 30;
+            const wavData = appendWavHeader(batch);
+            const uri = (FileSystem.cacheDirectory || FileSystem.documentDirectory || '')
+                + `stream_${Date.now()}_${Math.random().toString(36).slice(2, 7)}.wav`;
+            await FileSystem.writeAsStringAsync(uri, wavData, { encoding: FileSystem.EncodingType.Base64 });
+            if (aiResponseInterruptedRef.current) { streamingBusyRef.current = false; return; }
+
+            const { sound: newSound } = await Audio.Sound.createAsync(
+                { uri },
+                { progressUpdateIntervalMillis: 33 }
+            );
+            if (aiResponseInterruptedRef.current) {
+                try { await newSound.unloadAsync(); } catch {}
+                streamingBusyRef.current = false;
+                return;
+            }
+            currentSound.current = newSound;
+            await newSound.playAsync();
+            newSound.setOnPlaybackStatusUpdate((status: any) => {
+                if (aiResponseInterruptedRef.current) return;
+                if (status.isLoaded) {
+                    if (status.isPlaying && !status.didJustFinish) {
+                        playbackPositionMsRef.current = status.positionMillis;
+                        const idx = Math.floor((status.positionMillis / 1000) * envelopeFps);
+                        aiAmplitudeRef.current = envelope[idx] ?? 0;
+                    }
+                    if (status.didJustFinish) {
+                        aiAmplitudeRef.current = 0;
+                        playbackPositionMsRef.current = 0;
+                        try { newSound.unloadAsync(); } catch {}
+                        if (currentSound.current === newSound) currentSound.current = null;
+                        streamingBusyRef.current = false;
+                        // Whatever accumulated during this chunk's playback is now
+                        // ready to play — keep the pipe full to minimize gap.
+                        playPendingStreamAudio();
+                    }
+                }
+            });
+        } catch (error) {
+            console.error('Stream play error', error);
+            streamingBusyRef.current = false;
+            // Don't leave the user locked — try to drain whatever else is pending.
+            playPendingStreamAudio();
         }
     };
 
@@ -1732,13 +2337,32 @@ ${combosCatalogForPrompt()}
                         currentResponseItemIdRef.current = null;
                         newSound.unloadAsync();
                         if (currentSound.current === newSound) currentSound.current = null;
-                        console.log('Playback finished — resuming mic input');
-                        isSpeaking.current = false;
-                        setIsAiSpeaking(false);
+                        // Grace period: the device speaker's tail + room reverb still
+                        // hit the mic for a few hundred ms after didJustFinish. Keep
+                        // isSpeaking true during that window so the mic handler drops
+                        // our own echo instead of shipping it to the server (which
+                        // otherwise fires a spurious `interrupted: true` and locks
+                        // the user out). Tracked via echoTailTimerRef so a new AI
+                        // turn starting mid-grace can cancel this before it fires.
+                        if (echoTailTimerRef.current) clearTimeout(echoTailTimerRef.current);
+                        echoTailTimerRef.current = setTimeout(() => {
+                            echoTailTimerRef.current = null;
+                            console.log('Playback finished (echo-tail elapsed) — resuming mic input');
+                            isSpeaking.current = false;
+                            setIsAiSpeaking(false);
+                        }, 600);
                     }
                 }
             });
-        } catch (error) { console.error('Play error', error); }
+        } catch (error) {
+            console.error('Play error', error);
+            // Failsafe: if playback threw, isSpeaking was armed when the first
+            // inlineData chunk arrived but will never be cleared by didJustFinish.
+            // Without this reset, the mic gate stays shut and the user can speak
+            // forever without the server hearing a single chunk.
+            isSpeaking.current = false;
+            setIsAiSpeaking(false);
+        }
     };
 
     const startRecording = async () => {
@@ -1783,9 +2407,13 @@ ${combosCatalogForPrompt()}
                     }
                     
                     // --- ULTRA SENSITIVE UX CURVE ---
-                    // 1. Strict Peak Noise Gate: Ignores static room noise entirely (typical peak < 200).
-                    let effectiveAmp = Math.max(0, maxPeak - 200); 
-                    
+                    // 1. Peak Noise Gate: ignores static room noise (AC, fan, typing)
+                    //    and speaker-echo tail. 200 was too permissive on real devices
+                    //    — the visualizer animated against ambient even when the user
+                    //    was silent. 700 clears most room noise while still catching
+                    //    soft speech.
+                    let effectiveAmp = Math.max(0, maxPeak - 700);
+
                     // 2. High-Sensitivity Ceiling. (1500 peak means normal talking will hit 100% easily).
                     let rawNorm = Math.min(effectiveAmp, 1500) / 1500;
                     
@@ -1802,7 +2430,8 @@ ${combosCatalogForPrompt()}
                 }
 
                 if (ws.current && ws.current.readyState === WebSocket.OPEN) {
-                    ws.current.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: data }));
+                    // Helper resamples 24k→16k for Gemini; sends raw for OpenAI.
+                    sendAudioChunk(ws.current, data);
                 }
             });
 
@@ -1823,8 +2452,7 @@ ${combosCatalogForPrompt()}
             setStatus('Processing...');
 
             if (ws.current && ws.current.readyState === WebSocket.OPEN) {
-                ws.current.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
-                ws.current.send(JSON.stringify({ type: 'response.create', response: { modalities: ["text", "audio"] } }));
+                sendAudioCommit(ws.current);
             }
         } catch (err) {
             console.error('Stop Rec Error:', err);
@@ -1871,13 +2499,13 @@ ${combosCatalogForPrompt()}
                     }
 
                     if (token) {
-                        connectToOpenAIDirectly(token);
+                        connectVoiceSession(token);
                     } else {
                         setStatus('Auth Error');
                     }
                 } catch (e) {
                     console.error("Auth check failed", e);
-                    connectToOpenAIDirectly('guest-demo-token');
+                    connectVoiceSession('guest-demo-token');
                 }
             } else {
                 startRecording();
@@ -2032,27 +2660,13 @@ ${combosCatalogForPrompt()}
                                             .filter(Boolean)
                                             .join('، ') || 'لا شيء';
                                         const text = `[تحديث من الواجهة] المستخدم غيّر "${group.title_ar}" يدوياً إلى: ${names}. لا تعلّق، فقط تابع وسجّل هذا في ذاكرتك.`;
-                                        ws.current.send(JSON.stringify({
-                                            type: 'conversation.item.create',
-                                            item: {
-                                                type: 'message',
-                                                role: 'user',
-                                                content: [{ type: 'input_text', text }],
-                                            },
-                                        }));
+                                        sendInjectedUserText(ws.current, text, false);
                                         console.log('[UI→AI]', text);
                                     }}
                                     onUserQuantity={(q) => {
                                         if (!ws.current || ws.current.readyState !== WebSocket.OPEN) return;
                                         const text = `[تحديث من الواجهة] المستخدم غيّر الكمية يدوياً إلى ${q}. لا تعلّق، فقط تابع.`;
-                                        ws.current.send(JSON.stringify({
-                                            type: 'conversation.item.create',
-                                            item: {
-                                                type: 'message',
-                                                role: 'user',
-                                                content: [{ type: 'input_text', text }],
-                                            },
-                                        }));
+                                        sendInjectedUserText(ws.current, text, false);
                                         console.log('[UI→AI]', text);
                                     }}
                                     onAddToCart={(payload) => {
@@ -2068,14 +2682,7 @@ ${combosCatalogForPrompt()}
                                         ]);
                                         if (ws.current && ws.current.readyState === WebSocket.OPEN) {
                                             const text = `[تحديث من الواجهة] المستخدم ضغط زر "إضافة" بنفسه. تمت إضافة ${payload.summary_ar} × ${payload.quantity} بسعر ${payload.line_total.toFixed(0)} ريال للسلة. الوجبة تم إنهاؤها. اسأله باختصار إذا يبي شي ثاني.`;
-                                            ws.current.send(JSON.stringify({
-                                                type: 'conversation.item.create',
-                                                item: {
-                                                    type: 'message',
-                                                    role: 'user',
-                                                    content: [{ type: 'input_text', text }],
-                                                },
-                                            }));
+                                            sendInjectedUserText(ws.current, text, false);
                                             console.log('[UI→AI]', text);
                                         }
                                         comboStore.clearActive();
@@ -2186,8 +2793,7 @@ ${combosCatalogForPrompt()}
                         }}
                         onEdit={() => {
                             if (ws.current && ws.current.readyState === WebSocket.OPEN) {
-                                ws.current.send(JSON.stringify({ type: 'conversation.item.create', item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'أبي أعدّل الطلب' }] } }));
-                                ws.current.send(JSON.stringify({ type: 'response.create' }));
+                                sendInjectedUserText(ws.current, 'أبي أعدّل الطلب');
                             }
                         }}
                     />
@@ -2200,8 +2806,7 @@ ${combosCatalogForPrompt()}
                     onClose={() => setShowCheckout(false)}
                     onPay={() => {
                         if (ws.current && ws.current.readyState === WebSocket.OPEN) {
-                            ws.current.send(JSON.stringify({ type: 'conversation.item.create', item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'أكد الطلب' }] } }));
-                            ws.current.send(JSON.stringify({ type: 'response.create' }));
+                            sendInjectedUserText(ws.current, 'أكد الطلب');
                         }
                         setShowCheckout(false);
                     }}
@@ -2226,7 +2831,7 @@ const s = StyleSheet.create({
     labelRow: { flexDirection: 'row', alignItems: 'center', gap: 12 },
     labelIcon: { fontSize: 22 },
     labelText: { fontSize: 17, fontWeight: '600', color: '#fff', letterSpacing: -0.01 },
-    chatCanvas: { position: 'absolute', top: '32%', bottom: 130, left: 0, right: 0, paddingHorizontal: 20, zIndex: 4 },
+    chatCanvas: { position: 'absolute', top: '25%', bottom: 130, left: 0, right: 0, paddingHorizontal: 20, zIndex: 4 },
     userBubble: { alignSelf: 'flex-end', backgroundColor: '#e8e8e8', borderRadius: 20, borderBottomRightRadius: 6, paddingHorizontal: 16, paddingVertical: 10, marginBottom: 10, maxWidth: '78%' },
     aiBubble: { alignSelf: 'flex-start', marginBottom: 10, maxWidth: '78%', paddingHorizontal: 4, paddingVertical: 6 },
     userText: { fontSize: 16, color: '#111', textAlign: 'right', lineHeight: 24 },
