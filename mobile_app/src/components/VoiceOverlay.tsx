@@ -147,6 +147,10 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
     const streamingPendingRef = useRef<string>('');           // unplayed base64 PCM
     const streamingBusyRef = useRef<boolean>(false);           // a chunk is playing now
     const streamingTurnEndedRef = useRef<boolean>(false);      // turnComplete seen, no more chunks
+    // Armed while the deferred first-kick setTimeout is pending, so repeated
+    // incoming chunks in the same event-loop tick don't each queue their own
+    // kick after the threshold is first crossed.
+    const firstKickPendingRef = useRef<boolean>(false);
     // First batch threshold ≈ 400ms of 24kHz PCM16. Larger = smoother start/less
     // under-run risk; smaller = snappier first-audio latency. 400ms is our sweet spot.
     const STREAM_FIRST_BATCH_MIN_B64 = 12800;
@@ -1764,6 +1768,7 @@ ${combosCatalogForPrompt()}
                             streamingPendingRef.current = '';
                             streamingTurnEndedRef.current = false;
                             streamingBusyRef.current = false;
+                            firstKickPendingRef.current = false;
                             const sound = currentSound.current;
                             if (sound) {
                                 try { sound.setOnPlaybackStatusUpdate(null); } catch {}
@@ -1788,6 +1793,21 @@ ${combosCatalogForPrompt()}
                         // free for the audio status callback so speech doesn't lag.
                         // turnComplete flushes the final text immediately below.
                         if (sc.outputTranscription?.text) {
+                            // outputTranscription lands ~50-150 ms BEFORE the
+                            // first inlineData audio chunk in most turns, so
+                            // flip the visualizer to 'respond' here too. That
+                            // head start lets the 870 ms orb→bars transition
+                            // overlap more of the audio-init latency window,
+                            // which is the main reason the bars used to appear
+                            // well after the AI had already started talking.
+                            if (!isSpeaking.current && !aiResponseInterruptedRef.current) {
+                                isSpeaking.current = true;
+                                setIsAiSpeaking(true);
+                                if (echoTailTimerRef.current) {
+                                    clearTimeout(echoTailTimerRef.current);
+                                    echoTailTimerRef.current = null;
+                                }
+                            }
                             geminiOutputTranscript += sc.outputTranscription.text;
                             if (!captionFlushTimerRef.current) {
                                 captionFlushTimerRef.current = setTimeout(() => {
@@ -1823,9 +1843,23 @@ ${combosCatalogForPrompt()}
                                     // Start playback as soon as first batch threshold is
                                     // met. Subsequent chunks are picked up automatically
                                     // by the recursive playPendingStreamAudio chain.
+                                    //
+                                    // Defer the first kick to the next macrotask so React
+                                    // gets a clean tick to commit setIsAiSpeaking(true)
+                                    // and fire the AIVisualizer useEffect — otherwise
+                                    // FileSystem.writeAsStringAsync / Audio.Sound.createAsync
+                                    // in playPendingStreamAudio start queuing work on the
+                                    // JS thread immediately and the orb-transition's first
+                                    // JS-driver frames land late. Subsequent (recursive)
+                                    // kicks stay synchronous so mid-turn chunks don't gap.
                                     if (!streamingBusyRef.current
+                                        && !firstKickPendingRef.current
                                         && streamingPendingRef.current.length >= STREAM_FIRST_BATCH_MIN_B64) {
-                                        playPendingStreamAudio();
+                                        firstKickPendingRef.current = true;
+                                        setTimeout(() => {
+                                            firstKickPendingRef.current = false;
+                                            playPendingStreamAudio();
+                                        }, 0);
                                     }
                                 }
                             }
@@ -2382,12 +2416,20 @@ ${combosCatalogForPrompt()}
             // so the mic re-opens AFTER the device speaker's tail has decayed.
             if (streamingTurnEndedRef.current) {
                 streamingTurnEndedRef.current = false;
+                // Flip the visualizer back to 'listen' IMMEDIATELY so the orb
+                // starts collapsing the moment audio actually ends. The mic
+                // echo-tail gate (isSpeaking.current) is a separate concern —
+                // it stays armed for 600 ms so the device-speaker tail and room
+                // reverb don't trip server VAD back to the user. Coupling both
+                // to the same timeout was the ~2-second "visualizer still
+                // bouncing after AI stopped" lag.
+                aiAmplitudeRef.current = 0;
+                setIsAiSpeaking(false);
                 if (echoTailTimerRef.current) clearTimeout(echoTailTimerRef.current);
                 echoTailTimerRef.current = setTimeout(() => {
                     echoTailTimerRef.current = null;
-                    console.log('Streaming finished (echo-tail elapsed) — resuming mic');
+                    console.log('Streaming echo-tail elapsed — resuming mic');
                     isSpeaking.current = false;
-                    setIsAiSpeaking(false);
                 }, 600);
             }
             return;
@@ -2579,12 +2621,15 @@ ${combosCatalogForPrompt()}
                         // otherwise fires a spurious `interrupted: true` and locks
                         // the user out). Tracked via echoTailTimerRef so a new AI
                         // turn starting mid-grace can cancel this before it fires.
+                        // Visualizer flips back immediately so the orb collapse
+                        // runs concurrently with the echo-tail window rather
+                        // than after it. Mic gate stays armed inside the timer.
+                        setIsAiSpeaking(false);
                         if (echoTailTimerRef.current) clearTimeout(echoTailTimerRef.current);
                         echoTailTimerRef.current = setTimeout(() => {
                             echoTailTimerRef.current = null;
-                            console.log('Playback finished (echo-tail elapsed) — resuming mic input');
+                            console.log('Playback echo-tail elapsed — resuming mic input');
                             isSpeaking.current = false;
-                            setIsAiSpeaking(false);
                         }, 600);
                     }
                 }
