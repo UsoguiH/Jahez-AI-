@@ -30,6 +30,11 @@ import {
     sendAudioCommit,
     sendInterrupt,
 } from '../lib/voiceProtocol';
+import {
+    openTranscribeSession,
+    sendTranscribeChunk,
+    TranscribeHandle,
+} from '../lib/transcribeSession';
 // Hoisted from inside playAudioChunk — the dynamic import on first call was
 // costing ~50-100ms every time the AI started talking.
 import { appendWavHeader, computeAmplitudeEnvelope } from '../lib/audioUtils';
@@ -72,6 +77,10 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
     const [activeRestaurantUI, setActiveRestaurantUI] = useState<Restaurant | null>(null);
     const scrollViewRef = useRef<ScrollView>(null);
     const ws = useRef<WebSocket | null>(null);
+    // Parallel transcription socket to OpenAI gpt-4o-transcribe. Runs alongside
+    // `ws` (Gemini Live) purely to produce the user-visible caption — Gemini's
+    // own inputTranscription is kept as a silent fallback if this socket fails.
+    const transcribeWs = useRef<TranscribeHandle | null>(null);
     const recording = useRef<Audio.Recording | null>(null);
     const audioBuffer = useRef<string>('');
     const currentSound = useRef<Audio.Sound | null>(null);
@@ -237,6 +246,11 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
                 console.log('Closing WebSocket...');
                 ws.current.close();
                 ws.current = null;
+            }
+            if (transcribeWs.current) {
+                console.log('Closing transcribe WebSocket...');
+                transcribeWs.current.close();
+                transcribeWs.current = null;
             }
             selectedRestaurantRef.current = null;
             setCartItems([]);
@@ -551,11 +565,14 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
             // Ball fades in sync with the absorb pop
             Animated.timing(dropOpacities[idx], { toValue: 0, duration: 180, delay: 780, easing: easeOut, useNativeDriver: true }),
             Animated.timing(dropScales[idx], { toValue: 0.85, duration: 180, delay: 780, easing: easeOut, useNativeDriver: true }),
-            // Blob pops outward on impact, then eases back to rest
+            // Blob pops outward on impact, then eases down to the visualizer's rest size
+            // (AIVisualizer's CIRCLE_SIZE is 98px = coreBlob 140px × 0.7, so ending blobScale
+            // at 0.7 means the handoff to the visualizer at chatReady is size-matched and the
+            // user sees a smooth shrink instead of a pop-to-smaller on unmount).
             Animated.sequence([
                 Animated.delay(780),
                 Animated.timing(blobScale, { toValue: 1.2, duration: 200, easing: easeOut, useNativeDriver: true }),
-                Animated.timing(blobScale, { toValue: 1, duration: 360, easing: easeInOut, useNativeDriver: true }),
+                Animated.timing(blobScale, { toValue: 0.7, duration: 360, easing: easeInOut, useNativeDriver: true }),
             ]),
             // Lift the whole orb container up
             Animated.timing(orbTransY, { toValue: LIFT, duration: 600, delay: 740, easing: easeInOut, useNativeDriver: true }),
@@ -604,7 +621,8 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
         setTimeout(() => {
             setIsListening(false); stopRecording();
             if (ws.current) { ws.current.close(); ws.current = null; }
-            setIsConnected(false); 
+            if (transcribeWs.current) { transcribeWs.current.close(); transcribeWs.current = null; }
+            setIsConnected(false);
             selectedRestaurantRef.current = null;
             setActiveRestaurantUI(null);
             selectedRestAnimScale.setValue(0);
@@ -628,20 +646,25 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
         
         const animBar = (i: number) => {
             if (isMutedRef.current) return;
-            // Aggressively expanded visualizer height constraints -> Center max reaches 52px out of 60px capsule
-            const ranges = [ [10, 20], [12, 38], [14, 52], [12, 38], [10, 20] ];
+            // Widened dynamic range — resting height is lower and peak height is higher, so
+            // the visible delta between silence and loud speech is obvious. User should
+            // clearly see bars jump the moment they start talking.
+            const ranges = [ [6, 26], [8, 44], [8, 56], [8, 44], [6, 26] ];
             const [minH, maxH] = ranges[i];
-            
+
             const vol = currentMicVolumeRef.current;
-            
+
             const intensity = Math.min(1, Math.max(0, vol));
             const target = minH + (maxH - minH) * intensity;
-            
-            Animated.timing(barHeightVals[i], { 
-                toValue: target, 
-                duration: 90, 
-                easing: Easing.linear, 
-                useNativeDriver: false 
+
+            // Per-bar duration offset — center bar is fastest, outer bars trail slightly so the
+            // visualizer reads like a wave responding to the voice instead of a rigid block.
+            const BAR_DUR = [150, 130, 110, 130, 150][i];
+            Animated.timing(barHeightVals[i], {
+                toValue: target,
+                duration: BAR_DUR,
+                easing: Easing.out(Easing.quad),
+                useNativeDriver: false
             }).start(() => animBar(i));
         };
         barHeightVals.forEach((_, i) => animBar(i));
@@ -1179,7 +1202,11 @@ ${combosCatalogForPrompt()}
                         modalities: ["text", "audio"],
                         input_audio_format: "pcm16",
                         output_audio_format: "pcm16",
-                        input_audio_transcription: { model: 'whisper-1' },
+                        input_audio_transcription: {
+                            model: 'gpt-4o-transcribe',
+                            language: 'ar',
+                            prompt: 'محادثة طلب طعام بالعربية السعودية. مطاعم: البيك، كودو، شاورمر، ماكدونالدز، هرفي، كنتاكي، صب واي، بيتزا هت، ستاربكس، ماما نورة، الطازج، باسكن روبنز، الرومانسية.',
+                        },
                         tools: tools,
                         tool_choice: 'auto',
                     }
@@ -1328,6 +1355,37 @@ ${combosCatalogForPrompt()}
     // ========================================================================
     const connectToGeminiLive = async (authToken: string) => {
         if (ws.current) return;
+
+        // Kick off the parallel OpenAI gpt-4o-transcribe socket. It mints its own
+        // ephemeral key and opens independently — failure here is non-fatal;
+        // Gemini's inputTranscription stays as the caption fallback so the chat
+        // log never goes blank. We fire-and-forget because the Gemini connect
+        // below shouldn't block on the ASR socket being ready.
+        if (!transcribeWs.current) {
+            openTranscribeSession(authToken, {
+                onFinal: (text) => {
+                    // Primary caption source for the chat log. Gemini's own
+                    // inputTranscription is suppressed when this socket is alive.
+                    setMessages(prev => [...prev, { role: 'user', text }]);
+                },
+                onClosed: () => {
+                    // Let the handle object reflect the close so the guard in
+                    // the Gemini turnComplete handler flips caption sourcing
+                    // back to Gemini for the rest of the session.
+                    if (transcribeWs.current && !transcribeWs.current.isAlive()) {
+                        transcribeWs.current = null;
+                    }
+                },
+                onError: (err) => {
+                    console.warn('[TRANSCRIBE] non-fatal error, Gemini fallback will take over:', err?.message || err);
+                },
+            }).then((handle) => {
+                transcribeWs.current = handle;
+            }).catch((err) => {
+                console.warn('[TRANSCRIBE] failed to open, using Gemini inputTranscription:', err?.message || err);
+                transcribeWs.current = null;
+            });
+        }
 
         // Gemini function declarations — same schemas as OpenAI tools but stripped
         // of the `type: 'function'` wrapper and grouped under functionDeclarations.
@@ -1692,7 +1750,15 @@ ${combosCatalogForPrompt()}
 
                             if (geminiInputTranscript.trim()) {
                                 const finalUserText = geminiInputTranscript.trim();
-                                setMessages(prev => [...prev, { role: 'user', text: finalUserText }]);
+                                // Caption is sourced from gpt-4o-transcribe when its
+                                // socket is alive (higher accuracy on Saudi dialect).
+                                // Gemini's inputTranscription only surfaces to the UI
+                                // when the ASR socket is down, so we have a caption
+                                // at all instead of a blank chat log.
+                                const asrAlive = !!transcribeWs.current && transcribeWs.current.isAlive();
+                                if (!asrAlive) {
+                                    setMessages(prev => [...prev, { role: 'user', text: finalUserText }]);
+                                }
                                 geminiInputTranscript = '';
                             }
 
@@ -2408,21 +2474,23 @@ ${combosCatalogForPrompt()}
                     
                     // --- ULTRA SENSITIVE UX CURVE ---
                     // 1. Peak Noise Gate: ignores static room noise (AC, fan, typing)
-                    //    and speaker-echo tail. 200 was too permissive on real devices
-                    //    — the visualizer animated against ambient even when the user
-                    //    was silent. 700 clears most room noise while still catching
-                    //    soft speech.
-                    let effectiveAmp = Math.max(0, maxPeak - 700);
+                    //    and speaker-echo tail. 400 is the sweet spot — still clears most
+                    //    ambient, but catches soft speech and the start of a word.
+                    let effectiveAmp = Math.max(0, maxPeak - 400);
 
-                    // 2. High-Sensitivity Ceiling. (1500 peak means normal talking will hit 100% easily).
-                    let rawNorm = Math.min(effectiveAmp, 1500) / 1500;
-                    
-                    // 3. Logarithmic Hearing Curve: Boosts whispers physically.
-                    let normRaw = Math.pow(rawNorm, 0.6);
-                    
-                    // 4. Rhythm Bouncing: 80% attack for instant tracking, 50% decay for fast drops.
+                    // 2. Sensitivity Ceiling — a normal speaking voice peaks around ~900-1100
+                    //    in raw int16; dropping the ceiling from 1500 to 900 means ordinary
+                    //    conversation maxes out the bars, instead of only shouting doing so.
+                    let rawNorm = Math.min(effectiveAmp, 900) / 900;
+
+                    // 3. Logarithmic Hearing Curve: pow 0.5 boosts whispers harder than 0.6
+                    //    did, so the bars feel alive even on quiet utterances.
+                    let normRaw = Math.pow(rawNorm, 0.5);
+
+                    // 4. Rhythm Bouncing: 78% attack for fast-but-smooth rise (no jerky snap),
+                    //    40% decay so bars glide back down naturally instead of hanging.
                     let last = currentMicVolumeRef.current;
-                    let v = normRaw > last ? (last * 0.2 + normRaw * 0.8) : (last * 0.5 + normRaw * 0.5);
+                    let v = normRaw > last ? (last * 0.22 + normRaw * 0.78) : (last * 0.6 + normRaw * 0.4);
                     
                     currentMicVolumeRef.current = v;
                 } catch (e) {
@@ -2432,6 +2500,13 @@ ${combosCatalogForPrompt()}
                 if (ws.current && ws.current.readyState === WebSocket.OPEN) {
                     // Helper resamples 24k→16k for Gemini; sends raw for OpenAI.
                     sendAudioChunk(ws.current, data);
+                }
+                // Parallel fan-out to OpenAI gpt-4o-transcribe for the user caption.
+                // Raw 24 kHz PCM16 (no resample) — OpenAI's native input rate, so
+                // the caption-critical path sees pristine audio. No-op if the
+                // socket isn't open; Gemini fallback covers that case.
+                if (transcribeWs.current) {
+                    sendTranscribeChunk(transcribeWs.current, data);
                 }
             });
 
@@ -2517,8 +2592,8 @@ ${combosCatalogForPrompt()}
     const ORB_SIZE = 140;
     const categoryLabels = [
         { iconName: 'mic-outline', text: 'طلب وجبة جديدة', disabled: false, color: '#000' },
-        { iconName: 'reload-outline', text: 'إعادة الطلب السابق (قريباً)', disabled: true, color: '#7a7a7a' },
         { iconName: 'time-outline', text: 'تتبع حالة الطلب (قريباً)', disabled: true, color: '#7a7a7a' },
+        { iconName: 'headset-outline', text: 'المساعدة والدعم (قريباً)', disabled: true, color: '#7a7a7a' },
     ];
 
     return (
@@ -2828,9 +2903,9 @@ const s = StyleSheet.create({
     loadDot: { position: 'absolute', width: 44, height: 44, borderRadius: 22, backgroundColor: '#000' },
     dropBlob: { position: 'absolute', borderRadius: 999, backgroundColor: '#000', alignItems: 'center', justifyContent: 'center', overflow: 'hidden' },
     dropTouchable: { flex: 1, width: '100%', alignItems: 'center', justifyContent: 'center' },
-    labelRow: { flexDirection: 'row', alignItems: 'center', gap: 12 },
+    labelRow: { flexDirection: 'row', alignItems: 'center', gap: 10 },
     labelIcon: { fontSize: 22 },
-    labelText: { fontSize: 17, fontWeight: '600', color: '#fff', letterSpacing: -0.01 },
+    labelText: { fontSize: 17, fontWeight: '600', color: '#fff', letterSpacing: -0.01, textAlign: 'center', lineHeight: 22 },
     chatCanvas: { position: 'absolute', top: '25%', bottom: 130, left: 0, right: 0, paddingHorizontal: 20, zIndex: 4 },
     userBubble: { alignSelf: 'flex-end', backgroundColor: '#e8e8e8', borderRadius: 20, borderBottomRightRadius: 6, paddingHorizontal: 16, paddingVertical: 10, marginBottom: 10, maxWidth: '78%' },
     aiBubble: { alignSelf: 'flex-start', marginBottom: 10, maxWidth: '78%', paddingHorizontal: 4, paddingVertical: 6 },
