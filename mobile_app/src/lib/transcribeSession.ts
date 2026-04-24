@@ -91,6 +91,23 @@ export const openTranscribeSession = async (
         try {
             // Transcription socket always delivers JSON text frames.
             const raw: string = typeof evt.data === 'string' ? evt.data : String(evt.data);
+
+            // Cheap substring pre-filter BEFORE JSON.parse. OpenAI Realtime emits
+            // ~5-15 messages per user utterance: session.created/updated,
+            // input_audio_buffer.speech_started/stopped/committed, transcription
+            // deltas and completed, plus occasional heartbeats. We only surface
+            // deltas (optional) / completed / error — parsing the rest was
+            // 10-15 pointless JSON.parse calls per utterance on the main
+            // thread, landing right when the Gemini audio response starts
+            // decoding, which is exactly when the JS thread needs to be quiet
+            // so the audio init callbacks don't get starved. Substring-check
+            // is O(n) string scan, ~50x cheaper than JSON.parse for typical
+            // OpenAI Realtime frames.
+            const hasCompleted = raw.indexOf('transcription.completed') !== -1;
+            const hasDelta = raw.indexOf('transcription.delta') !== -1;
+            const hasError = raw.indexOf('"type":"error"') !== -1;
+            if (!hasCompleted && !hasError && !(hasDelta && cb.onPartial)) return;
+
             const msg = JSON.parse(raw);
 
             if (msg.type === 'conversation.item.input_audio_transcription.delta' && msg.delta) {

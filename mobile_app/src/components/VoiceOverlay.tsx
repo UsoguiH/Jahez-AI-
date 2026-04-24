@@ -37,7 +37,7 @@ import {
 } from '../lib/transcribeSession';
 // Hoisted from inside playAudioChunk — the dynamic import on first call was
 // costing ~50-100ms every time the AI started talking.
-import { appendWavHeader, computeAmplitudeEnvelope } from '../lib/audioUtils';
+import { appendWavHeader, computeAmplitudeEnvelope, computePeakEnvelopeFast } from '../lib/audioUtils';
 
 // Polyfill for global
 if (!global.btoa) { global.btoa = btoa; }
@@ -56,6 +56,31 @@ interface VoiceOverlayProps {
     visible: boolean;
     onClose: () => void;
 }
+
+// Gemini Live occasionally re-emits the full outputTranscription after the
+// delta stream has already delivered the same content, producing a bubble
+// with its text concatenated twice ("ABC...?ABC...?"). We catch both the
+// exact-double case and the "half+punct+half" variant and strip the copy.
+const dedupeDoubled = (input: string): string => {
+    const s = input.trim();
+    const n = s.length;
+    if (n < 8) return s;
+    // Pure A+A (no separator) — the case in the screenshot.
+    if (n % 2 === 0) {
+        const half = n / 2;
+        if (s.slice(0, half) === s.slice(half)) return s.slice(0, half);
+    }
+    // A + (space|punct) + A — tolerate a few separator chars in the middle.
+    const mid = Math.floor(n / 2);
+    for (let offset = -3; offset <= 3; offset++) {
+        const splitAt = mid + offset;
+        if (splitAt <= 0 || splitAt >= n) continue;
+        const left = s.slice(0, splitAt).trim();
+        const right = s.slice(splitAt).trim();
+        if (left.length >= 6 && left === right) return left;
+    }
+    return s;
+};
 
 const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
     const activeCombo = useActiveCombo();
@@ -103,6 +128,15 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
     // Tracked as a ref so a new AI turn starting mid-grace can cancel it — otherwise
     // the old timer fires inside the new turn and wrongly opens the mic.
     const echoTailTimerRef = useRef<any>(null);
+
+    // Caption-throttle state. Gemini's outputTranscription deltas arrive at
+    // 10-30 Hz; each used to fire a setCurrentAiText which re-renders the
+    // whole overlay tree (cart, messages, visualizer). On a mid-range
+    // Android that's enough JS work to starve the audio callbacks, which is
+    // why AI speech felt laggy. We coalesce updates to 10 Hz — the user
+    // can't read faster than that anyway — and flush the final text on
+    // turnComplete so the live caption never drops characters.
+    const captionFlushTimerRef = useRef<any>(null);
 
     // --- Gemini streaming playback state ---
     // Instead of buffering the entire AI turn before playing (which makes the user
@@ -260,6 +294,10 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
             setSuggestedRestaurants([]);
             setMessages([]);
             setCurrentAiText('');
+            if (captionFlushTimerRef.current) {
+                clearTimeout(captionFlushTimerRef.current);
+                captionFlushTimerRef.current = null;
+            }
             isMutedRef.current = false;
             setIsMuted(false);
         }
@@ -628,6 +666,10 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
             selectedRestAnimScale.setValue(0);
             setCartItems([]); setOrderConfirmed(false); setOrderDetails(null);
             setShowFullCart(false); setSuggestedRestaurants([]); setMessages([]); setCurrentAiText('');
+            if (captionFlushTimerRef.current) {
+                clearTimeout(captionFlushTimerRef.current);
+                captionFlushTimerRef.current = null;
+            }
             setChatReady(false);
             runConnectingSequence();
         }, 700);
@@ -1356,6 +1398,25 @@ ${combosCatalogForPrompt()}
     const connectToGeminiLive = async (authToken: string) => {
         if (ws.current) return;
 
+        // Pre-acquire audio focus BEFORE the greeting audio can arrive. If we
+        // wait until startRecording() (fires 1.5s after setupComplete), the
+        // first chunks of the AI greeting can hit playAsync while the audio
+        // session is still unconfigured, throwing AudioFocusNotAcquired and
+        // triggering the double-voice recovery path. Setting the mode here is
+        // cheap (idempotent on repeated calls) and guarantees playback-ready
+        // state by the time Gemini starts streaming.
+        try {
+            await Audio.setAudioModeAsync({
+                allowsRecordingIOS: true,
+                playsInSilentModeIOS: true,
+                staysActiveInBackground: true,
+                shouldDuckAndroid: true,
+                playThroughEarpieceAndroid: false,
+            });
+        } catch (e) {
+            console.warn('[GEMINI] setAudioModeAsync failed (non-fatal):', e);
+        }
+
         // Kick off the parallel OpenAI gpt-4o-transcribe socket. It mints its own
         // ephemeral key and opens independently — failure here is non-fatal;
         // Gemini's inputTranscription stays as the caption fallback so the chat
@@ -1366,7 +1427,22 @@ ${combosCatalogForPrompt()}
                 onFinal: (text) => {
                     // Primary caption source for the chat log. Gemini's own
                     // inputTranscription is suppressed when this socket is alive.
-                    setMessages(prev => [...prev, { role: 'user', text }]);
+                    //
+                    // Deferred to the next macrotask via setTimeout(0) because
+                    // OpenAI's semantic VAD (eagerness=low) tends to commit the
+                    // user utterance ~500ms after they stop — which overlaps
+                    // with the first Gemini audio chunk and the orb listen→
+                    // respond transition. A synchronous setMessages here
+                    // re-renders the entire overlay tree (messages list, cart,
+                    // visualizer) at exactly that moment, which is what made
+                    // the AI voice sound laggy at the transition. setTimeout(0)
+                    // yields to the pending audio-init microtasks and pushes
+                    // the React render to the next event-loop tick — still
+                    // feels instant to the user, but no longer collides with
+                    // the audio-critical moment.
+                    setTimeout(() => {
+                        setMessages(prev => [...prev, { role: 'user', text }]);
+                    }, 0);
                 },
                 onClosed: () => {
                     // Let the handle object reflect the close so the guard in
@@ -1641,11 +1717,6 @@ ${combosCatalogForPrompt()}
                         });
                     }
 
-                    // Diagnostic: log truncated single-line preview of EVERY incoming
-                    // frame. Strip newlines+whitespace so RN's console doesn't clip at \n.
-                    // (Remove once audio path is confirmed.)
-                    console.log('[GEMINI] frame:', raw.replace(/\s+/g, ' ').slice(0, 250));
-
                     const msg = JSON.parse(raw);
 
                     if (msg.setupComplete) {
@@ -1681,6 +1752,12 @@ ${combosCatalogForPrompt()}
                             console.log('[GEMINI] Server-detected user interrupt');
                             aiResponseInterruptedRef.current = true;
                             audioBuffer.current = '';
+                            // Drop any throttled caption flush — caption is about
+                            // to be cleared, we don't want it flashing back in.
+                            if (captionFlushTimerRef.current) {
+                                clearTimeout(captionFlushTimerRef.current);
+                                captionFlushTimerRef.current = null;
+                            }
                             // Clear any streaming-playback state so the recursive
                             // didJustFinish chain exits instead of continuing to
                             // drain buffered audio that the user just talked over.
@@ -1705,9 +1782,19 @@ ${combosCatalogForPrompt()}
                         }
 
                         // Incremental text of AI's spoken output — drive the live caption.
+                        // Throttled to ~10 Hz: each setCurrentAiText re-renders the
+                        // full overlay tree (cart + messages + visualizer), and
+                        // deltas arrive at 10-30 Hz. Coalescing keeps the JS thread
+                        // free for the audio status callback so speech doesn't lag.
+                        // turnComplete flushes the final text immediately below.
                         if (sc.outputTranscription?.text) {
                             geminiOutputTranscript += sc.outputTranscription.text;
-                            setCurrentAiText(geminiOutputTranscript);
+                            if (!captionFlushTimerRef.current) {
+                                captionFlushTimerRef.current = setTimeout(() => {
+                                    captionFlushTimerRef.current = null;
+                                    setCurrentAiText(geminiOutputTranscript);
+                                }, 100);
+                            }
                         }
 
                         // Audio chunks from the model. inlineData.data is base64 PCM16 @ 24 kHz.
@@ -1748,6 +1835,15 @@ ${combosCatalogForPrompt()}
                         if (sc.turnComplete) {
                             console.log('[GEMINI] turnComplete, audio buffer length:', audioBuffer.current.length);
 
+                            // Cancel any pending throttled caption flush — the
+                            // geminiOutputTranscript is about to be committed to
+                            // the message log and currentAiText cleared, so a
+                            // late-firing setCurrentAiText would flash stale text.
+                            if (captionFlushTimerRef.current) {
+                                clearTimeout(captionFlushTimerRef.current);
+                                captionFlushTimerRef.current = null;
+                            }
+
                             if (geminiInputTranscript.trim()) {
                                 const finalUserText = geminiInputTranscript.trim();
                                 // Caption is sourced from gpt-4o-transcribe when its
@@ -1764,7 +1860,7 @@ ${combosCatalogForPrompt()}
 
                             // Flush accumulated AI caption into the message log.
                             if (geminiOutputTranscript.trim()) {
-                                const finalAiText = geminiOutputTranscript.trim();
+                                const finalAiText = dedupeDoubled(geminiOutputTranscript);
                                 setMessages(prev => [...prev, { role: 'ai', text: finalAiText }]);
                                 geminiOutputTranscript = '';
                             }
@@ -2301,38 +2397,95 @@ ${combosCatalogForPrompt()}
         streamingPendingRef.current = '';
         streamingBusyRef.current = true;
 
+        // Hard guarantee: only ONE sound object is alive at a time. If a
+        // prior sound is still attached (e.g. a play attempt half-failed and
+        // left it loaded), tear it down before loading the next batch. This
+        // is what prevents the "two AIs speaking over each other on entry"
+        // bug — previously an orphaned sound whose playAsync threw
+        // AudioFocusNotAcquired during the chat-transition kept playing
+        // once focus arrived, while the retry spawned a second sound on top.
+        //
+        // Key detail: we DETACH the callback and NULL the ref synchronously
+        // so nothing can re-trigger from the old sound, but the actual
+        // stop/unload runs in the background. Awaiting those here added
+        // ~100-150ms between batches on weak phones — audible as a lag.
+        const prevSound = currentSound.current;
+        if (prevSound) {
+            currentSound.current = null;
+            try { prevSound.setOnPlaybackStatusUpdate(null); } catch {}
+            // Fire-and-forget teardown. stopAsync is called before the new
+            // sound's playAsync resolves, so there's no audible overlap.
+            (async () => {
+                try { await prevSound.stopAsync(); } catch {}
+                try { await prevSound.unloadAsync(); } catch {}
+            })();
+        }
+
+        let newSound: Audio.Sound | null = null;
+        // Envelope is computed AFTER playAsync resolves (see setTimeout below).
+        // It starts empty so the first few progress ticks see length 0 and
+        // leave aiAmplitudeRef at 0 — by the time real amplitude kicks in
+        // (~10-20 ms after audio starts), the visualizer's procedural idle
+        // animation is already moving the bars, so the transition looks
+        // seamless. This ordering is what lets audio init be immediate while
+        // still giving real amplitude-driven bars during the chunk.
+        let envelope: number[] = [];
+        const envelopeFps = 30;
         try {
-            const envelope = computeAmplitudeEnvelope(batch, 24000, 30);
-            const envelopeFps = 30;
             const wavData = appendWavHeader(batch);
             const uri = (FileSystem.cacheDirectory || FileSystem.documentDirectory || '')
                 + `stream_${Date.now()}_${Math.random().toString(36).slice(2, 7)}.wav`;
             await FileSystem.writeAsStringAsync(uri, wavData, { encoding: FileSystem.EncodingType.Base64 });
             if (aiResponseInterruptedRef.current) { streamingBusyRef.current = false; return; }
 
-            const { sound: newSound } = await Audio.Sound.createAsync(
+            // 50ms poll (20 Hz) — fine-grained enough for the bars to visibly
+            // react to each syllable, but coarse enough that bridge callback
+            // traffic doesn't starve other JS work during AI speech.
+            const created = await Audio.Sound.createAsync(
                 { uri },
-                { progressUpdateIntervalMillis: 33 }
+                { progressUpdateIntervalMillis: 50 }
             );
+            newSound = created.sound;
             if (aiResponseInterruptedRef.current) {
                 try { await newSound.unloadAsync(); } catch {}
+                newSound = null;
                 streamingBusyRef.current = false;
                 return;
             }
             currentSound.current = newSound;
             await newSound.playAsync();
+
+            // Envelope computation, deferred to AFTER playAsync resolves. This
+            // is the key fix that gives us real-amplitude bars WITHOUT blocking
+            // the audio-start critical path: by the time this runs, the audio
+            // is already playing on the native side, so the ~4-8 ms this now
+            // takes (computePeakEnvelopeFast — peak-based, strided) costs us
+            // nothing visible. Guarded against post-interrupt races.
+            setTimeout(() => {
+                if (aiResponseInterruptedRef.current) return;
+                if (currentSound.current !== newSound) return;
+                envelope = computePeakEnvelopeFast(batch, 24000, envelopeFps);
+            }, 0);
+
             newSound.setOnPlaybackStatusUpdate((status: any) => {
                 if (aiResponseInterruptedRef.current) return;
                 if (status.isLoaded) {
                     if (status.isPlaying && !status.didJustFinish) {
                         playbackPositionMsRef.current = status.positionMillis;
-                        const idx = Math.floor((status.positionMillis / 1000) * envelopeFps);
-                        aiAmplitudeRef.current = envelope[idx] ?? 0;
+                        // Drive the visualizer bars from the real envelope.
+                        // If the envelope hasn't been computed yet (first few
+                        // ticks after playAsync), amplitudeRef stays at 0 and
+                        // the visualizer falls through to its idle procedural
+                        // animation — zero visual glitch during the handover.
+                        if (envelope.length > 0) {
+                            const idx = Math.floor((status.positionMillis / 1000) * envelopeFps);
+                            aiAmplitudeRef.current = envelope[idx] ?? 0;
+                        }
                     }
                     if (status.didJustFinish) {
                         aiAmplitudeRef.current = 0;
                         playbackPositionMsRef.current = 0;
-                        try { newSound.unloadAsync(); } catch {}
+                        try { newSound!.unloadAsync(); } catch {}
                         if (currentSound.current === newSound) currentSound.current = null;
                         streamingBusyRef.current = false;
                         // Whatever accumulated during this chunk's playback is now
@@ -2343,9 +2496,25 @@ ${combosCatalogForPrompt()}
             });
         } catch (error) {
             console.error('Stream play error', error);
+            // Tear down the half-created sound so it can't come back to life
+            // when audio focus is granted later — the exact failure mode
+            // behind the double-voice bug on chat entry.
+            if (newSound) {
+                const failed = newSound;
+                newSound = null;
+                if (currentSound.current === failed) currentSound.current = null;
+                try { failed.setOnPlaybackStatusUpdate(null); } catch {}
+                try { await failed.stopAsync(); } catch {}
+                try { await failed.unloadAsync(); } catch {}
+            }
             streamingBusyRef.current = false;
-            // Don't leave the user locked — try to drain whatever else is pending.
-            playPendingStreamAudio();
+            // Defer the drain retry. A synchronous retry after AudioFocus
+            // failure just fails the same way and risks stacking playbacks
+            // if the first sound's play queued up successfully after the
+            // exception. 120ms is enough time for focus to settle on Android
+            // without being audible as a mid-sentence gap (our previous
+            // 500ms was — users noticed it as a clear half-second pause).
+            setTimeout(() => { playPendingStreamAudio(); }, 120);
         }
     };
 
