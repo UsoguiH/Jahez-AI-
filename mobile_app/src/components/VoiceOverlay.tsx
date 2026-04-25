@@ -1505,6 +1505,14 @@ ${combosCatalogForPrompt()}
             let partialAcc = '';
             openTranscribeSession(authToken, {
                 onPartial: (delta) => {
+                    // Drop partials that arrive while the AI is speaking or
+                    // within the echo-tail window. The mic picks up speaker
+                    // output and gpt-4o-transcribe — when the audio is unclear
+                    // — invents plausible Arabic instead of transcribing,
+                    // including meta-text like "this is a Saudi Arabic
+                    // conversation about ordering food". Those false partials
+                    // were also tripping the fast cuisine intent detector.
+                    if (isSpeaking.current || echoTailTimerRef.current) return;
                     partialAcc += delta;
                     tryFastCuisineFromTranscript(partialAcc);
                 },
@@ -1515,6 +1523,9 @@ ${combosCatalogForPrompt()}
                     // turnComplete) still gets per-utterance reset.
                     partialAcc = '';
                     fastSuggestFiredRef.current = false;
+                    // Same echo-suppression as onPartial — don't push hallucinated
+                    // transcripts into the chat as fake user messages.
+                    if (isSpeaking.current || echoTailTimerRef.current) return;
                     // Primary caption source for the chat log. Gemini's own
                     // inputTranscription is suppressed when this socket is alive.
                     //
@@ -1671,12 +1682,13 @@ ${combosCatalogForPrompt()}
             const accessToken = data?.access_token;
             const rawKey = data?.raw_key;
             if (!accessToken && !rawKey) {
-                console.error("No access_token or raw_key in data:", data);
+                // Log just the keys present, never the values — `data` may
+                // include `raw_key` and dumping the whole object leaks it.
+                console.error("No access_token or raw_key in response. keys:", Object.keys(data || {}));
                 throw new Error('No Gemini auth credential returned');
             }
 
             console.log('Got Gemini token, connecting to Gemini Live...');
-            console.log('[GEMINI] token prefix:', (rawKey || accessToken).slice(0, 8) + '...');
 
             // DIAGNOSTIC (3.1 swap): switched to v1beta unconstrained
             // BidiGenerateContent with raw API key — the v1alpha Constrained
@@ -1684,7 +1696,11 @@ ${combosCatalogForPrompt()}
             // serverContent frame. Once 3.1 is confirmed working, swap back to
             // a proper proxy so the key doesn't ship to clients.
             const url = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${encodeURIComponent(rawKey)}`;
-            console.log('[GEMINI] WS url (masked):', url.replace(/access_token=[^&]+/, 'access_token=***'));
+            // Mask BOTH `key=` and `access_token=` query params so the raw
+            // credential never lands in dev logs (was previously printed in
+            // plaintext because the regex only matched access_token=).
+            const maskedUrl = url.replace(/(\?|&)(key|access_token)=[^&]+/g, '$1$2=***');
+            console.log('[GEMINI] WS url:', maskedUrl);
 
             // @ts-ignore
             const socket = new WebSocket(url);
@@ -1801,33 +1817,6 @@ ${combosCatalogForPrompt()}
 
                     const msg = JSON.parse(raw);
 
-                    // DEBUG (3.1 swap) — log every server frame's top-level shape
-                    // so we can see if 3.1 is responding at all and into which
-                    // field. Audio chunks are huge so summarize, not dump.
-                    try {
-                        const keys = Object.keys(msg);
-                        const summary: any = {};
-                        for (const k of keys) {
-                            if (k === 'serverContent') {
-                                const sc = msg.serverContent || {};
-                                summary.serverContent = Object.keys(sc).reduce((a: any, kk) => {
-                                    if (kk === 'modelTurn') {
-                                        const partKinds = (sc.modelTurn?.parts || []).map((p: any) => Object.keys(p)[0]);
-                                        a.modelTurn = { partKinds };
-                                    } else {
-                                        a[kk] = typeof sc[kk] === 'object' ? Object.keys(sc[kk] || {}) : sc[kk];
-                                    }
-                                    return a;
-                                }, {});
-                            } else if (k === 'usageMetadata') {
-                                summary.usageMetadata = msg.usageMetadata;
-                            } else {
-                                summary[k] = typeof msg[k] === 'object' ? Object.keys(msg[k] || {}) : msg[k];
-                            }
-                        }
-                        console.log('[GEMINI-RAW]', JSON.stringify(summary));
-                    } catch {}
-
                     if (msg.setupComplete) {
                         console.log('[GEMINI] setupComplete received');
                         setupCompleted = true;
@@ -1899,8 +1888,10 @@ ${combosCatalogForPrompt()}
                         // Incremental ASR of user speech — accumulate until turnComplete.
                         // Also feed the live transcript into the fast cuisine
                         // detector so cards can appear before the user even
-                        // finishes the sentence.
-                        if (sc.inputTranscription?.text) {
+                        // finishes the sentence. Drop deltas that arrive while
+                        // the AI is speaking or in the echo-tail window — those
+                        // are echo of speaker output, not the user.
+                        if (sc.inputTranscription?.text && !isSpeaking.current && !echoTailTimerRef.current) {
                             geminiInputTranscript += sc.inputTranscription.text;
                             tryFastCuisineFromTranscript(geminiInputTranscript);
                         }
@@ -2916,7 +2907,14 @@ ${combosCatalogForPrompt()}
                 // Raw 24 kHz PCM16 (no resample) — OpenAI's native input rate, so
                 // the caption-critical path sees pristine audio. No-op if the
                 // socket isn't open; Gemini fallback covers that case.
-                if (transcribeWs.current) {
+                //
+                // Skip while the AI is speaking (or in the echo-tail window):
+                // gpt-4o-transcribe will hallucinate plausible Arabic when fed
+                // unclear audio (echo of speaker output), producing fake user
+                // messages like "this is a Saudi Arabic conversation about
+                // food ordering". The main socket still gets the audio so
+                // barge-in / server VAD can detect a real interruption.
+                if (transcribeWs.current && !isSpeaking.current && !echoTailTimerRef.current) {
                     sendTranscribeChunk(transcribeWs.current, data);
                 }
             });
