@@ -158,14 +158,6 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
     // First batch threshold ≈ 400ms of 24kHz PCM16. Larger = smoother start/less
     // under-run risk; smaller = snappier first-audio latency. 400ms is our sweet spot.
     const STREAM_FIRST_BATCH_MIN_B64 = 12800;
-    // Pre-prepared NEXT chunk's Audio.Sound — created while the CURRENT chunk
-    // plays, so the swap on didJustFinish is near-zero gap (~10 ms playAsync
-    // instead of ~130 ms FileSystem write + createAsync). Without this preroll,
-    // every chunk-to-chunk transition pays full setup cost, and over 20-50
-    // chunks per AI turn the accumulated gap is what showed up as the
-    // 1-5 second tail between "AI audibly stopped" and "orb returned to listen".
-    const prerolledStreamRef = useRef<{ sound: Audio.Sound; batch: string; envelope: number[] } | null>(null);
-    const prerollInFlightRef = useRef<boolean>(false);
 
     // Restaurant menu data — pre-loaded on mic open for zero latency
     const restaurantsRef = useRef<Restaurant[]>([]);
@@ -797,10 +789,6 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
             try { await sound.unloadAsync(); } catch {}
             if (currentSound.current === sound) currentSound.current = null;
         }
-        // Drop any pre-rolled next chunk too — it would otherwise fire when
-        // the streaming pipeline next ticked and play audio over the
-        // post-interrupt silence.
-        await teardownPrerolled();
         aiAmplitudeShared.value = 0;
 
         const socket = ws.current;
@@ -1792,9 +1780,6 @@ ${combosCatalogForPrompt()}
                                 try { await sound.unloadAsync(); } catch {}
                                 if (currentSound.current === sound) currentSound.current = null;
                             }
-                            // Drop the pre-rolled chunk so it doesn't fire after the
-                            // user has barged in.
-                            await teardownPrerolled();
                             visualizerRef.current?.forceListen();
                             isSpeaking.current = false;
                             setIsAiSpeaking(false);
@@ -1879,17 +1864,6 @@ ${combosCatalogForPrompt()}
                                             firstKickPendingRef.current = false;
                                             playPendingStreamAudio();
                                         }, 0);
-                                    } else if (streamingBusyRef.current
-                                        && !prerollInFlightRef.current
-                                        && !prerolledStreamRef.current) {
-                                        // Active playback + no preroll yet → kick preparation
-                                        // of the next chunk so the swap on didJustFinish is
-                                        // near-zero gap. Without this re-kick, prepareNextChunk
-                                        // scheduled at the start of the current chunk's
-                                        // playback could have no-op'd (empty buffer at the
-                                        // time) and then never re-fired even though new audio
-                                        // has now arrived.
-                                        setTimeout(() => prepareNextChunk(), 0);
                                     }
                                 }
                             }
@@ -1935,9 +1909,6 @@ ${combosCatalogForPrompt()}
                                 audioBuffer.current = '';
                                 streamingPendingRef.current = '';
                                 streamingTurnEndedRef.current = false;
-                                // Drop the pre-rolled chunk too — same reason as
-                                // the sc.interrupted path above.
-                                await teardownPrerolled();
                             } else {
                                 // Tell the streaming pipeline no more chunks are coming.
                                 // If a chunk is currently playing, the recursive
@@ -2434,204 +2405,19 @@ ${combosCatalogForPrompt()}
         }
     };
 
-    // Streaming playback for Gemini, with one-deep PRE-ROLL of the next chunk.
-    //
-    // The key insight: each chunk pays ~50 ms FileSystem.writeAsStringAsync +
-    // ~50-100 ms Audio.Sound.createAsync of setup BEFORE its playAsync can fire.
-    // Doing that work serially on every didJustFinish accumulated 3-5 seconds
-    // of dead air over a long AI turn — visible as the orb staying in 'respond'
-    // state for several seconds after the user perceived speech as "done".
-    //
-    // Fix: as soon as the CURRENT chunk starts playing, kick off prepareNextChunk
-    // in the background so by the time current's didJustFinish fires, the next
-    // sound is already loaded and only needs playAsync (~10 ms). The swap
-    // becomes near-zero gap, and the queue drains at real-time after turnComplete
-    // instead of trailing wall-clock time behind it.
-
-    // Tear down whatever is currently playing or pre-rolled. Used by interrupt
-    // and turn-cleanup paths so nothing keeps draining audio after the user
-    // (or server) decided the AI should stop.
-    const teardownPrerolled = async () => {
-        const p = prerolledStreamRef.current;
-        prerolledStreamRef.current = null;
-        if (p) {
-            try { p.sound.setOnPlaybackStatusUpdate(null); } catch {}
-            try { await p.sound.unloadAsync(); } catch {}
-        }
-    };
-
-    // Drain streamingPendingRef into a paused Audio.Sound stored in
-    // prerolledStreamRef, ready for instant playAsync when the current chunk
-    // ends. Idempotent — guarded by prerollInFlightRef and the existence
-    // of prerolledStreamRef so concurrent calls don't double-prepare.
-    const prepareNextChunk = async () => {
-        if (prerollInFlightRef.current) return;
-        if (prerolledStreamRef.current) return;
-        if (aiResponseInterruptedRef.current) return;
-        if (streamingPendingRef.current.length === 0) return;
-
-        prerollInFlightRef.current = true;
-        const batch = streamingPendingRef.current;
-        streamingPendingRef.current = '';
-
-        let createdSound: Audio.Sound | null = null;
-        try {
-            const wavData = appendWavHeader(batch);
-            const uri = (FileSystem.cacheDirectory || FileSystem.documentDirectory || '')
-                + `stream_${Date.now()}_${Math.random().toString(36).slice(2, 7)}.wav`;
-            await FileSystem.writeAsStringAsync(uri, wavData, { encoding: FileSystem.EncodingType.Base64 });
-            if (aiResponseInterruptedRef.current) return;
-            const created = await Audio.Sound.createAsync(
-                { uri },
-                { progressUpdateIntervalMillis: 50, shouldPlay: false },
-            );
-            createdSound = created.sound;
-            if (aiResponseInterruptedRef.current) {
-                try { await createdSound.unloadAsync(); } catch {}
-                createdSound = null;
-                return;
-            }
-            // Compute envelope upfront — we have time before this sound is
-            // actually played. Cheap (~4-8 ms) since the batch is bounded by
-            // how much accumulated during the current chunk's playback.
-            const envelope = computePeakEnvelopeFast(batch, 24000, 30);
-            prerolledStreamRef.current = { sound: createdSound, batch, envelope };
-        } catch (e) {
-            console.error('Preroll prepare failed:', e);
-            // Put the batch back so the slow path can retry it.
-            if (!aiResponseInterruptedRef.current) {
-                streamingPendingRef.current = batch + streamingPendingRef.current;
-            }
-            if (createdSound) {
-                try { await createdSound.unloadAsync(); } catch {}
-            }
-        } finally {
-            prerollInFlightRef.current = false;
-        }
-    };
-
-    // Wire a sound that's about to play (or just started playing) to its
-    // status callback. Drives the visualizer envelope, swaps to the prerolled
-    // chunk on didJustFinish, and schedules the NEXT preroll. Shared between
-    // the slow path (createAsync inside playPendingStreamAudio) and the fast
-    // path (prerolled sound consumed on chunk end).
-    const wireSoundCallbacks = (sound: Audio.Sound, batch: string, envelope: number[]) => {
-        const envFps = 30;
-        // If envelope wasn't pre-computed (slow path), compute it on a deferred
-        // tick so it doesn't block the audio-start critical path.
-        let envRef = { value: envelope };
-        if (envRef.value.length === 0) {
-            setTimeout(() => {
-                if (aiResponseInterruptedRef.current) return;
-                if (currentSound.current !== sound) return;
-                envRef.value = computePeakEnvelopeFast(batch, 24000, envFps);
-            }, 0);
-        }
-
-        sound.setOnPlaybackStatusUpdate((status: any) => {
-            if (aiResponseInterruptedRef.current) return;
-            if (!status.isLoaded) return;
-            if (status.isPlaying && !status.didJustFinish) {
-                playbackPositionMsRef.current = status.positionMillis;
-                if (envRef.value.length > 0) {
-                    const idx = Math.floor((status.positionMillis / 1000) * envFps);
-                    aiAmplitudeShared.value = envRef.value[idx] ?? 0;
-                }
-            }
-            if (status.didJustFinish) {
-                aiAmplitudeShared.value = 0;
-                playbackPositionMsRef.current = 0;
-                try { sound.setOnPlaybackStatusUpdate(null); } catch {}
-                try { sound.unloadAsync(); } catch {}
-                if (currentSound.current === sound) currentSound.current = null;
-                streamingBusyRef.current = false;
-
-                // FAST PATH: a prerolled sound is already loaded — swap it in
-                // with just a playAsync call. This is what eliminates the
-                // 100-150 ms inter-chunk gap.
-                const next = prerolledStreamRef.current;
-                if (next && !aiResponseInterruptedRef.current) {
-                    prerolledStreamRef.current = null;
-                    streamingBusyRef.current = true;
-                    currentSound.current = next.sound;
-                    next.sound.playAsync().then(() => {
-                        wireSoundCallbacks(next.sound, next.batch, next.envelope);
-                        // Schedule preparation of the chunk AFTER this one.
-                        setTimeout(() => prepareNextChunk(), 0);
-                    }).catch(e => {
-                        console.error('Preroll play failed:', e);
-                        if (currentSound.current === next.sound) currentSound.current = null;
-                        streamingBusyRef.current = false;
-                        try { next.sound.unloadAsync(); } catch {}
-                        // Re-queue the batch and fall back to slow path.
-                        if (!aiResponseInterruptedRef.current) {
-                            streamingPendingRef.current = next.batch + streamingPendingRef.current;
-                        }
-                        playPendingStreamAudio();
-                    });
-                    return;
-                }
-
-                // SLOW PATH: nothing prerolled (e.g. preroll didn't finish in
-                // time, or buffer was empty). Fall back to the original drain
-                // logic, which also handles the turn-end echo-tail flip.
-                playPendingStreamAudio();
-            }
-        });
-
-        // Schedule preparation of the next chunk while THIS one plays. If the
-        // buffer is empty right now, the call will no-op; the WS message
-        // handler will re-trigger preparation when fresh chunks arrive.
-        setTimeout(() => prepareNextChunk(), 0);
-    };
-
+    // Streaming playback for Gemini: drains streamingPendingRef as a fresh WAV,
+    // plays it, and on finish recursively plays whatever else accumulated during
+    // that playback. When the queue empties and the turn has ended, arms the
+    // echo-tail timer so isSpeaking flips off (same grace logic as playAudioChunk).
     const playPendingStreamAudio = async () => {
         if (streamingBusyRef.current) return;
         if (aiResponseInterruptedRef.current) {
             streamingPendingRef.current = '';
-            await teardownPrerolled();
             return;
         }
-
-        // Fast path on entry too: if a sound is already prerolled (e.g. arrived
-        // before playback ever started, or we're recovering from a slow-path
-        // error), use it directly.
-        const prerolled = prerolledStreamRef.current;
-        if (prerolled) {
-            prerolledStreamRef.current = null;
-            streamingBusyRef.current = true;
-            // Tear down any orphaned sound (same hard-guarantee logic as below).
-            const prev = currentSound.current;
-            if (prev) {
-                currentSound.current = null;
-                try { prev.setOnPlaybackStatusUpdate(null); } catch {}
-                (async () => {
-                    try { await prev.stopAsync(); } catch {}
-                    try { await prev.unloadAsync(); } catch {}
-                })();
-            }
-            currentSound.current = prerolled.sound;
-            try {
-                await prerolled.sound.playAsync();
-                wireSoundCallbacks(prerolled.sound, prerolled.batch, prerolled.envelope);
-                setTimeout(() => prepareNextChunk(), 0);
-                return;
-            } catch (e) {
-                console.error('Stream play (prerolled) error:', e);
-                if (currentSound.current === prerolled.sound) currentSound.current = null;
-                streamingBusyRef.current = false;
-                try { await prerolled.sound.unloadAsync(); } catch {}
-                if (!aiResponseInterruptedRef.current) {
-                    streamingPendingRef.current = prerolled.batch + streamingPendingRef.current;
-                }
-                // Fall through to slow path below.
-            }
-        }
-
         if (streamingPendingRef.current.length === 0) {
-            // Nothing queued and nothing prerolled. If the turn is over, arm the
-            // echo-tail grace period so the mic re-opens AFTER the device
-            // speaker's tail has decayed.
+            // Nothing queued. If the turn is over, arm the echo-tail grace period
+            // so the mic re-opens AFTER the device speaker's tail has decayed.
             if (streamingTurnEndedRef.current) {
                 streamingTurnEndedRef.current = false;
                 // Flip the visualizer back to 'listen' IMMEDIATELY so the orb
@@ -2682,6 +2468,15 @@ ${combosCatalogForPrompt()}
         }
 
         let newSound: Audio.Sound | null = null;
+        // Envelope is computed AFTER playAsync resolves (see setTimeout below).
+        // It starts empty so the first few progress ticks see length 0 and
+        // leave aiAmplitudeShared at 0 — by the time real amplitude kicks in
+        // (~10-20 ms after audio starts), the visualizer's procedural idle
+        // animation is already moving the bars, so the transition looks
+        // seamless. This ordering is what lets audio init be immediate while
+        // still giving real amplitude-driven bars during the chunk.
+        let envelope: number[] = [];
+        const envelopeFps = 30;
         try {
             const wavData = appendWavHeader(batch);
             const uri = (FileSystem.cacheDirectory || FileSystem.documentDirectory || '')
@@ -2705,10 +2500,46 @@ ${combosCatalogForPrompt()}
             }
             currentSound.current = newSound;
             await newSound.playAsync();
-            // Envelope is computed inside wireSoundCallbacks on a deferred tick
-            // (passes [] to indicate "not yet computed"), so audio start is not
-            // blocked by the ~4-8 ms peak-envelope scan.
-            wireSoundCallbacks(newSound, batch, []);
+
+            // Envelope computation, deferred to AFTER playAsync resolves. This
+            // is the key fix that gives us real-amplitude bars WITHOUT blocking
+            // the audio-start critical path: by the time this runs, the audio
+            // is already playing on the native side, so the ~4-8 ms this now
+            // takes (computePeakEnvelopeFast — peak-based, strided) costs us
+            // nothing visible. Guarded against post-interrupt races.
+            setTimeout(() => {
+                if (aiResponseInterruptedRef.current) return;
+                if (currentSound.current !== newSound) return;
+                envelope = computePeakEnvelopeFast(batch, 24000, envelopeFps);
+            }, 0);
+
+            newSound.setOnPlaybackStatusUpdate((status: any) => {
+                if (aiResponseInterruptedRef.current) return;
+                if (status.isLoaded) {
+                    if (status.isPlaying && !status.didJustFinish) {
+                        playbackPositionMsRef.current = status.positionMillis;
+                        // Drive the visualizer bars from the real envelope.
+                        // If the envelope hasn't been computed yet (first few
+                        // ticks after playAsync), amplitude stays at 0 and
+                        // the visualizer falls through to its idle procedural
+                        // animation — zero visual glitch during the handover.
+                        if (envelope.length > 0) {
+                            const idx = Math.floor((status.positionMillis / 1000) * envelopeFps);
+                            aiAmplitudeShared.value = envelope[idx] ?? 0;
+                        }
+                    }
+                    if (status.didJustFinish) {
+                        aiAmplitudeShared.value = 0;
+                        playbackPositionMsRef.current = 0;
+                        try { newSound!.unloadAsync(); } catch {}
+                        if (currentSound.current === newSound) currentSound.current = null;
+                        streamingBusyRef.current = false;
+                        // Whatever accumulated during this chunk's playback is now
+                        // ready to play — keep the pipe full to minimize gap.
+                        playPendingStreamAudio();
+                    }
+                }
+            });
         } catch (error) {
             console.error('Stream play error', error);
             // Tear down the half-created sound so it can't come back to life
