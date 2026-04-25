@@ -45,6 +45,35 @@ export const CUISINE_MAP: Record<string, string[]> = {
     'مندي': ['الرومانسية'],
 };
 
+// Client-side fast-path — used by VoiceOverlay to detect cuisine intent
+// from live ASR partials and call handleSuggestRestaurants BEFORE the
+// model's tool call lands. Each entry maps the canonical CUISINE_MAP key
+// to common Arabic spellings/colloquial variants the user might say.
+// Match is a simple substring scan: cheap enough to run on every partial
+// delta without affecting transcription latency.
+const FAST_CUISINE_PATTERNS: Array<{ key: string; patterns: string[] }> = [
+    { key: 'برجر', patterns: ['برجر', 'برغر', 'همبرجر', 'همبرغر'] },
+    { key: 'بيتزا', patterns: ['بيتزا', 'بيزا'] },
+    { key: 'دجاج', patterns: ['دجاج', 'فروج', 'بروست'] },
+    { key: 'شاورما', patterns: ['شاورما', 'شاورم', 'شارمه'] },
+    { key: 'قهوة', patterns: ['قهوه', 'قهوة', 'كوفي', 'كافيه'] },
+    { key: 'حلا', patterns: ['حلى', 'حلوى', 'آيس كريم', 'ايس كريم'] },
+    { key: 'ساندوتش', patterns: ['ساندوتش', 'سندوتش', 'ساندويش', 'ساندويتش'] },
+    { key: 'كبسة', patterns: ['كبسة', 'كابسة'] },
+    { key: 'مندي', patterns: ['مندي'] },
+];
+
+export const detectCuisineIntent = (transcript: string): string | null => {
+    if (!transcript) return null;
+    const t = transcript.toLowerCase();
+    for (const entry of FAST_CUISINE_PATTERNS) {
+        for (const p of entry.patterns) {
+            if (t.includes(p)) return entry.key;
+        }
+    }
+    return null;
+};
+
 // ─── Individual Card ────────────────────────────────────────────
 const AnimatedCard: React.FC<{
     restaurant: RestaurantSuggestion;
@@ -78,18 +107,17 @@ const AnimatedCard: React.FC<{
     const dismissScale = useRef(new Animated.Value(1)).current;
     const dismissSlide = useRef(new Animated.Value(0)).current;
 
-    // Entrance — tightened: 50ms stagger (was 120) and 280ms duration (was 450)
-    // so all cards land in ~430ms total instead of ~810ms. Logo pop runs
-    // concurrently with the card landing instead of waiting for it to finish.
+    // Entrance: staggered card landing followed by a logo pop on each card.
     useEffect(() => {
-        const delay = index * 50;
+        const delay = index * 120;
         setTimeout(() => {
             Animated.parallel([
-                Animated.timing(cardFade, { toValue: 1, duration: 280, easing: Easing.out(Easing.cubic), useNativeDriver: true }),
-                Animated.spring(cardSlide, { toValue: 0, tension: 70, friction: 8, useNativeDriver: true }),
-                Animated.spring(cardScale, { toValue: 1, tension: 80, friction: 7, useNativeDriver: true }),
-                Animated.spring(logoScale, { toValue: 1, tension: 120, friction: 6, useNativeDriver: true }),
-            ]).start();
+                Animated.timing(cardFade, { toValue: 1, duration: 450, easing: Easing.out(Easing.cubic), useNativeDriver: true }),
+                Animated.spring(cardSlide, { toValue: 0, tension: 50, friction: 8, useNativeDriver: true }),
+                Animated.spring(cardScale, { toValue: 1, tension: 60, friction: 7, useNativeDriver: true }),
+            ]).start(() => {
+                Animated.spring(logoScale, { toValue: 1, tension: 120, friction: 6, useNativeDriver: true }).start();
+            });
         }, delay);
     }, []);
 
@@ -303,11 +331,10 @@ const RestaurantSuggestions: React.FC<RestaurantSuggestionsProps> = ({ restauran
 
     const handleCardSelect = (name: string) => {
         setSelectedName(name);
-        // Fire onSelect immediately so menu injection / next-screen work starts
-        // on the same frame as the tap. The selection celebration (glow + check
-        // pop + ring) keeps animating in parallel — the parent's UI transition
-        // doesn't unmount these cards instantly, so the user still sees the
-        // satisfying confirmation, just without an artificial 900ms gate.
+        // Fire onSelect immediately — parent runs the local select flow on the
+        // same frame so the top-right logo spring kicks in <500 ms. The parent
+        // defers unmounting these cards by 700 ms so the celebration (glow +
+        // check pop + ring) plays through before they disappear.
         onSelect(name);
     };
 

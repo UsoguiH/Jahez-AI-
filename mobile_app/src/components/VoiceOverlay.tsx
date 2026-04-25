@@ -13,7 +13,7 @@ import CheckoutScreen from './CheckoutScreen';
 import AIVisualizer, { AIVisualizerHandle } from './AIVisualizer';
 import InlineCartWidget from './InlineCartWidget';
 import OrderConfirmation from './OrderConfirmation';
-import RestaurantSuggestions, { CUISINE_MAP } from './RestaurantSuggestions';
+import RestaurantSuggestions, { CUISINE_MAP, detectCuisineIntent } from './RestaurantSuggestions';
 import { getRestaurantLogo } from '../lib/restaurantLogos';
 import { comboStore, useActiveCombo } from '../state/comboStore';
 import { ComboItem } from '../data/mcdonaldsCombo';
@@ -160,6 +160,11 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
     // messages and pending playAudioChunk calls from restarting playback after interrupt.
     // Reset on the next response.created so the NEXT assistant turn plays normally.
     const aiResponseInterruptedRef = useRef<boolean>(false);
+    // Set true once detectCuisineIntent fires handleSuggestRestaurants for the
+    // current user turn, so we don't re-fire on every subsequent partial delta
+    // (and don't double-fire when the AI's suggest_restaurants tool call lands).
+    // Cleared on turnComplete and on user interrupt.
+    const fastSuggestFiredRef = useRef<boolean>(false);
     // Imperative handle to the visualizer so interrupt can snap it to the orb instantly.
     const visualizerRef = useRef<AIVisualizerHandle | null>(null);
 
@@ -1495,8 +1500,21 @@ ${combosCatalogForPrompt()}
         // log never goes blank. We fire-and-forget because the Gemini connect
         // below shouldn't block on the ASR socket being ready.
         if (!transcribeWs.current) {
+            // Accumulate partials so the cuisine detector sees the full
+            // utterance-so-far each tick, not just one delta.
+            let partialAcc = '';
             openTranscribeSession(authToken, {
+                onPartial: (delta) => {
+                    partialAcc += delta;
+                    tryFastCuisineFromTranscript(partialAcc);
+                },
                 onFinal: (text) => {
+                    // Reset the partial buffer at the end of each utterance so
+                    // the next turn starts clean. Also re-arm the fast cuisine
+                    // path here so the OpenAI flow (which has no Gemini
+                    // turnComplete) still gets per-utterance reset.
+                    partialAcc = '';
+                    fastSuggestFiredRef.current = false;
                     // Primary caption source for the chat log. Gemini's own
                     // inputTranscription is suppressed when this socket is alive.
                     //
@@ -1842,6 +1860,10 @@ ${combosCatalogForPrompt()}
                         if (sc.interrupted) {
                             console.log('[GEMINI] Server-detected user interrupt');
                             aiResponseInterruptedRef.current = true;
+                            // User started a new turn by talking over the AI —
+                            // re-arm the fast cuisine path so the new utterance
+                            // can fire it.
+                            fastSuggestFiredRef.current = false;
                             audioBuffer.current = '';
                             // Drop any throttled caption flush — caption is about
                             // to be cleared, we don't want it flashing back in.
@@ -1875,8 +1897,12 @@ ${combosCatalogForPrompt()}
                         }
 
                         // Incremental ASR of user speech — accumulate until turnComplete.
+                        // Also feed the live transcript into the fast cuisine
+                        // detector so cards can appear before the user even
+                        // finishes the sentence.
                         if (sc.inputTranscription?.text) {
                             geminiInputTranscript += sc.inputTranscription.text;
+                            tryFastCuisineFromTranscript(geminiInputTranscript);
                         }
 
                         // Incremental text of AI's spoken output — drive the live caption.
@@ -2026,6 +2052,8 @@ ${combosCatalogForPrompt()}
                             // leaves the flag stuck true and every subsequent AI turn
                             // gets its audio dropped at the gate below.
                             aiResponseInterruptedRef.current = false;
+                            // Re-arm the fast cuisine path for the next user turn.
+                            fastSuggestFiredRef.current = false;
                         }
                     }
 
@@ -2113,7 +2141,8 @@ ${combosCatalogForPrompt()}
     };
 
     // Handle select_restaurant tool call — instant since menus are pre-loaded
-    const handleSelectRestaurant = (restaurantName: string, socket: WebSocket) => {
+    const handleSelectRestaurant = (restaurantName: string, socket: WebSocket, opts?: { clearCards?: boolean }) => {
+        const clearCards = opts?.clearCards !== false;
         console.log(`[TOOL] select_restaurant: "${restaurantName}"`);
 
         // Fuzzy match restaurant name — generic matching for all restaurants
@@ -2165,33 +2194,46 @@ ${combosCatalogForPrompt()}
             };
         }
 
+        // Idempotent re-entry guard: when a tap already fired this handler
+        // locally for instant logo appearance, the AI's later select_restaurant
+        // tool call lands here a second time — same restaurant, no UI change
+        // needed and we must NOT replay the spring (it would yank the logo
+        // back to scale 0 and pop again, looking like a glitch).
+        const alreadySelected = selectedRestaurantRef.current?.id === restaurant.id;
+
         selectedRestaurantRef.current = restaurant;
         setActiveRestaurantUI(restaurant);
-        setSuggestedRestaurants([]);
+        if (clearCards) setSuggestedRestaurants([]);
 
-        // Elegant spring entrance for the newly selected restaurant logo
-        selectedRestAnimScale.setValue(0);
-        Animated.spring(selectedRestAnimScale, {
-            toValue: 1,
-            tension: 50,
-            friction: 6,
-            useNativeDriver: true
-        }).start();
+        if (!alreadySelected) {
+            // Elegant spring entrance for the newly selected restaurant logo
+            selectedRestAnimScale.setValue(0);
+            Animated.spring(selectedRestAnimScale, {
+                toValue: 1,
+                tension: 50,
+                friction: 6,
+                useNativeDriver: true
+            }).start();
+        }
 
         // Build the validation index for this restaurant's menu so every
         // subsequent update_cart call can snap AI-supplied items to canonical
-        // names + prices (see validateCartItems in handleUpdateCart).
-        menuIndexRef.current = buildMenuIndex(restaurant.menu_json);
+        // names + prices (see validateCartItems in handleUpdateCart). Skip on
+        // the duplicate (tap-then-tool-call) entry — same menu_json builds
+        // an identical index.
+        if (!alreadySelected) {
+            menuIndexRef.current = buildMenuIndex(restaurant.menu_json);
 
-        // Inject the full menu into the AI's instructions — protocol helper
-        // handles OpenAI session.update vs Gemini clientContent injection.
-        // NOTE on Gemini native-audio: clientContent injection is unreliable —
-        // the model treats it as stray text rather than authoritative context,
-        // which was causing menu/price hallucinations (see tool response below
-        // for the real fix). We still fire this for OpenAI parity and as a
-        // best-effort secondary channel on Gemini.
-        const updatedInstructions = getMenuInstructions(restaurant);
-        sendSessionInstructions(socket, updatedInstructions);
+            // Inject the full menu into the AI's instructions — protocol helper
+            // handles OpenAI session.update vs Gemini clientContent injection.
+            // NOTE on Gemini native-audio: clientContent injection is unreliable —
+            // the model treats it as stray text rather than authoritative context,
+            // which was causing menu/price hallucinations (see tool response below
+            // for the real fix). We still fire this for OpenAI parity and as a
+            // best-effort secondary channel on Gemini.
+            const updatedInstructions = getMenuInstructions(restaurant);
+            sendSessionInstructions(socket, updatedInstructions);
+        }
 
         console.log(`[TOOL] Restaurant selected: ${restaurant.name_en}, menu injected with ${restaurant.menu_json.length} categories, index has ${menuIndexRef.current.items.length} items`);
 
@@ -2470,6 +2512,25 @@ ${combosCatalogForPrompt()}
     };
 
     // Handle suggest_restaurants — shows restaurant cards in chat
+    // Client-side fast-path runner — scans live ASR partials for a cuisine
+    // keyword and fires handleSuggestRestaurants the moment one matches.
+    // This bypasses the AI roundtrip (~1-2s for the suggest_restaurants tool
+    // call) so cards appear in <300ms after the user says "ابي برجر/بيتزا/…".
+    // The AI's later tool call lands as a no-op once cards are already shown,
+    // because handleSuggestRestaurants overwrites with the same matched list.
+    const tryFastCuisineFromTranscript = (transcript: string) => {
+        if (fastSuggestFiredRef.current) return;
+        // Don't preempt the AI when user is past the picker — they may be
+        // ordering inside a chosen restaurant or customizing a combo.
+        if (selectedRestaurantRef.current) return;
+        if (comboStore.getState().activeCombo) return;
+        const matched = detectCuisineIntent(transcript);
+        if (!matched) return;
+        fastSuggestFiredRef.current = true;
+        console.log(`[FAST] cuisine intent matched "${matched}" from partial: "${transcript}"`);
+        handleSuggestRestaurants(matched);
+    };
+
     const handleSuggestRestaurants = (cuisine: string) => {
         console.log(`[TOOL] suggest_restaurants: "${cuisine}"`);
         const matchingNames: string[] = [];
@@ -2497,9 +2558,22 @@ ${combosCatalogForPrompt()}
     // Handle restaurant card tap from suggestions
     const handleRestaurantCardTap = (restaurantNameAr: string) => {
         console.log(`[TAP] Restaurant card tapped: "${restaurantNameAr}"`);
-        setSuggestedRestaurants([]);
         setMessages(prev => [...prev, { role: 'user', text: `اخترت ${restaurantNameAr}` }]);
         if (ws.current && ws.current.readyState === WebSocket.OPEN) {
+            // Fire the local UI flip on the same frame as the tap so the logo
+            // spring kicks in <500ms — without this, the logo waits for the AI
+            // roundtrip (~1-2s) before select_restaurant comes back as a tool
+            // call. The AI still gets the injected text below to keep its
+            // dialogue state in sync; when its select_restaurant tool call
+            // lands, handleSelectRestaurant's idempotent guard makes the
+            // second invocation a no-op for the spring.
+            //
+            // clearCards: false keeps the suggestion cards mounted so the
+            // tapped card's selection celebration (glow + check pop + ring,
+            // ~600 ms) finishes playing before they unmount. The 700 ms timer
+            // below clears them after the celebration completes.
+            handleSelectRestaurant(restaurantNameAr, ws.current, { clearCards: false });
+            setTimeout(() => setSuggestedRestaurants([]), 700);
             sendInjectedUserText(ws.current, `اخترت ${restaurantNameAr}`);
         }
     };
