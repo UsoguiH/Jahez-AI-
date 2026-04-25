@@ -86,13 +86,6 @@ serve(async (req) => {
                 access_token: data.name,
                 expire_time: expireTime,
                 model: "models/gemini-3.1-flash-live-preview",
-                // DIAGNOSTIC (3.1 swap): returning raw API key so the client
-                // can hit the v1beta unconstrained BidiGenerateContent
-                // endpoint. The v1alpha Constrained endpoint appears to
-                // reject 3.1-flash-live-preview with WS 1008. Once the swap
-                // is verified working, replace this with a proper relay so
-                // the key never leaves the server.
-                raw_key: geminiKey,
             }),
             { headers: { ...corsHeaders, "Content-Type": "application/json" } }
         );
