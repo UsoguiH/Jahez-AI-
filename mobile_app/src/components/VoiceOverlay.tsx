@@ -1631,18 +1631,21 @@ ${combosCatalogForPrompt()}
             }
 
             const accessToken = data?.access_token;
-            if (!accessToken) {
-                console.error("No access_token in data:", data);
-                throw new Error('No Gemini access token returned');
+            const rawKey = data?.raw_key;
+            if (!accessToken && !rawKey) {
+                console.error("No access_token or raw_key in data:", data);
+                throw new Error('No Gemini auth credential returned');
             }
 
             console.log('Got Gemini token, connecting to Gemini Live...');
-            console.log('[GEMINI] token prefix:', accessToken.slice(0, 20) + '...');
+            console.log('[GEMINI] token prefix:', (rawKey || accessToken).slice(0, 8) + '...');
 
-            // v1alpha Constrained endpoint for ephemeral-token auth. The token was
-            // minted server-side with the model locked to 3.1-flash-live-preview,
-            // so a leaked client token can't be re-pointed at a more expensive model.
-            const url = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContentConstrained?access_token=${encodeURIComponent(accessToken)}`;
+            // DIAGNOSTIC (3.1 swap): switched to v1beta unconstrained
+            // BidiGenerateContent with raw API key — the v1alpha Constrained
+            // endpoint closes 3.1 sessions with WS 1008 right after the first
+            // serverContent frame. Once 3.1 is confirmed working, swap back to
+            // a proper proxy so the key doesn't ship to clients.
+            const url = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${encodeURIComponent(rawKey)}`;
             console.log('[GEMINI] WS url (masked):', url.replace(/access_token=[^&]+/, 'access_token=***'));
 
             // @ts-ignore
@@ -1691,26 +1694,19 @@ ${combosCatalogForPrompt()}
                 // on the client's subsequent setup frame.
                 const setupMsg = {
                     setup: {
-                        // Switched from gemini-3.1-flash-live-preview — it accepted setup
-                        // + greeting + audio but produced NO serverContent frames (only
-                        // sessionResumptionUpdate heartbeats) and eventually closed with
-                        // 1011 "Resource has been exhausted". Strong indication that 3.1
-                        // preview isn't generally available for our project tier.
-                        // The 2.5-native-audio preview is broadly accessible and supports
-                        // transcription + function tools.
-                        model: 'models/gemini-2.5-flash-native-audio-preview-12-2025',
+                        // Gemini 3.1 Flash Live Preview. Forum reports indicate the
+                        // 1011 "Resource exhausted" failure that hit the previous
+                        // 3.1 attempt was a 2.5-class infra bug largely fixed in 3.1.
+                        // Watch list for this model: ~10-min session disconnects,
+                        // 5G↔4G handoff lockups, occasional tool-call drift after
+                        // long history. Fall back to 2.5 GA if these block ordering.
+                        model: 'models/gemini-3.1-flash-live-preview',
                         generationConfig: {
                             responseModalities: ['AUDIO'],
                             speechConfig: {
                                 voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } },
                                 languageCode: 'ar-EG',
                             },
-                            // Disable thinking. On 2.5 native-audio, the default thinking
-                            // budget makes the model emit internal-reasoning text parts
-                            // ("**Crafting The Welcome**...") for 1–2s before any audio
-                            // tokens stream. thinkingBudget=0 skips that phase entirely —
-                            // response audio starts almost immediately after turnComplete.
-                            thinkingConfig: { thinkingBudget: 0 },
                         },
                         // Shorten end-of-turn silence detection. The default auto-VAD
                         // waits ~1000ms of silence before committing the user turn; 400ms
@@ -1723,10 +1719,6 @@ ${combosCatalogForPrompt()}
                         },
                         systemInstruction: { parts: [{ text: instructions }] },
                         tools: [{ functionDeclarations }],
-                        // Transcription both ways — parity with the OpenAI path.
-                        // Empty objects are the "enable with defaults" signal on 2.5
-                        // native-audio. Server emits serverContent.inputTranscription
-                        // and serverContent.outputTranscription deltas during the turn.
                         inputAudioTranscription: {},
                         outputAudioTranscription: {},
                     },
@@ -1770,6 +1762,33 @@ ${combosCatalogForPrompt()}
                     }
 
                     const msg = JSON.parse(raw);
+
+                    // DEBUG (3.1 swap) — log every server frame's top-level shape
+                    // so we can see if 3.1 is responding at all and into which
+                    // field. Audio chunks are huge so summarize, not dump.
+                    try {
+                        const keys = Object.keys(msg);
+                        const summary: any = {};
+                        for (const k of keys) {
+                            if (k === 'serverContent') {
+                                const sc = msg.serverContent || {};
+                                summary.serverContent = Object.keys(sc).reduce((a: any, kk) => {
+                                    if (kk === 'modelTurn') {
+                                        const partKinds = (sc.modelTurn?.parts || []).map((p: any) => Object.keys(p)[0]);
+                                        a.modelTurn = { partKinds };
+                                    } else {
+                                        a[kk] = typeof sc[kk] === 'object' ? Object.keys(sc[kk] || {}) : sc[kk];
+                                    }
+                                    return a;
+                                }, {});
+                            } else if (k === 'usageMetadata') {
+                                summary.usageMetadata = msg.usageMetadata;
+                            } else {
+                                summary[k] = typeof msg[k] === 'object' ? Object.keys(msg[k] || {}) : msg[k];
+                            }
+                        }
+                        console.log('[GEMINI-RAW]', JSON.stringify(summary));
+                    } catch {}
 
                     if (msg.setupComplete) {
                         console.log('[GEMINI] setupComplete received');

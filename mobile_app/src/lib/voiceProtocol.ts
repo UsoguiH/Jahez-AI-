@@ -60,12 +60,12 @@ export const sendInitialGreeting = (socket: WebSocket, greeting: string) => {
             response: { modalities: ['text', 'audio'], instructions: greeting },
         }));
     } else {
-        // Gemini — send the greeting prompt as a user turn and let the model respond.
+        // Gemini Live — text input goes via realtimeInput.text. The legacy
+        // clientContent.turns shape is silently ignored on 3.1 (model never
+        // responds) — caused the original 3.1 swap to look broken when it
+        // was actually just a wire-format mismatch.
         socket.send(JSON.stringify({
-            clientContent: {
-                turns: [{ role: 'user', parts: [{ text: greeting }] }],
-                turnComplete: true,
-            },
+            realtimeInput: { text: greeting },
         }));
     }
 };
@@ -94,12 +94,13 @@ export const sendInjectedUserText = (
             socket.send(JSON.stringify({ type: 'response.create' }));
         }
     } else {
-        // Gemini — turnComplete flag is what decides "should AI respond now".
+        // Gemini Live — text input goes via realtimeInput.text on 3.1.
+        // realtimeInput auto-triggers a response, so silent context updates
+        // (triggerResponse=false) need a different path; for now we treat
+        // them the same and rely on the system instruction to suppress
+        // commentary on minor UI events.
         socket.send(JSON.stringify({
-            clientContent: {
-                turns: [{ role: 'user', parts: [{ text }] }],
-                turnComplete: triggerResponse,
-            },
+            realtimeInput: { text },
         }));
     }
 };
