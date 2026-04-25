@@ -2937,9 +2937,26 @@ ${combosCatalogForPrompt()}
                     <ScrollView ref={scrollViewRef} contentContainerStyle={{ paddingBottom: 20 }}
                         onContentSizeChange={() => scrollViewRef.current?.scrollToEnd({ animated: true })}
                         showsVerticalScrollIndicator={false}>
-                        {/* Active Combo Card — visible when user tapped voice pill on a ComboCard */}
+                        {messages.map((msg, idx) => (
+                            <View key={idx} style={msg.role === 'user' ? s.userBubble : s.aiBubble}>
+                                <Text style={msg.role === 'user' ? s.userText : s.aiText}>{msg.text}</Text>
+                            </View>
+                        ))}
+                        {currentAiText ? (
+                            <View style={[s.aiBubble, { opacity: 0.7 }]}>
+                                <Text style={s.aiText}>{currentAiText}...</Text>
+                            </View>
+                        ) : null}
+                        {/* Restaurant Suggestions */}
+                        {suggestedRestaurants.length > 0 && (
+                            <RestaurantSuggestions restaurants={suggestedRestaurants} onSelect={handleRestaurantCardTap} />
+                        )}
+                        {/* Active Combo Card — visible when user tapped voice pill on a ComboCard.
+                            Rendered at the BOTTOM of the chat (after messages + suggestions) so the
+                            ScrollView's auto-scroll-to-end keeps it in view, instead of pushing it
+                            up off-screen as the conversation grows. */}
                         {activeCombo ? (
-                            <View style={{ marginHorizontal: 4, marginBottom: 12 }}>
+                            <View style={{ marginHorizontal: 4, marginTop: 12 }}>
                                 <ComboCard
                                     combo={activeCombo}
                                     hideVoicePill
@@ -2983,20 +3000,6 @@ ${combosCatalogForPrompt()}
                                 />
                             </View>
                         ) : null}
-                        {messages.map((msg, idx) => (
-                            <View key={idx} style={msg.role === 'user' ? s.userBubble : s.aiBubble}>
-                                <Text style={msg.role === 'user' ? s.userText : s.aiText}>{msg.text}</Text>
-                            </View>
-                        ))}
-                        {currentAiText ? (
-                            <View style={[s.aiBubble, { opacity: 0.7 }]}>
-                                <Text style={s.aiText}>{currentAiText}...</Text>
-                            </View>
-                        ) : null}
-                        {/* Restaurant Suggestions */}
-                        {suggestedRestaurants.length > 0 && (
-                            <RestaurantSuggestions restaurants={suggestedRestaurants} onSelect={handleRestaurantCardTap} />
-                        )}
                         {/* Inline Cart */}
                         {cartItems.length > 0 && !showFullCart && (
                             <InlineCartWidget items={cartItems} restaurantName={selectedRestaurantRef.current?.name_ar}
