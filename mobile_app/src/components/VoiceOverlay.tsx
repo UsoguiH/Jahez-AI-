@@ -1336,6 +1336,7 @@ ${combosCatalogForPrompt()}
                         aiResponseInterruptedRef.current = false;
                         // AI is generating — mute mic during playback to prevent echo
                         isSpeaking.current = true;
+                        visualizerRef.current?.flipTo('respond');
                         setIsAiSpeaking(true);
                         audioBuffer.current = '';
                     }
@@ -1854,6 +1855,7 @@ ${combosCatalogForPrompt()}
                             // well after the AI had already started talking.
                             if (!isSpeaking.current && !aiResponseInterruptedRef.current) {
                                 isSpeaking.current = true;
+                                visualizerRef.current?.flipTo('respond');
                                 setIsAiSpeaking(true);
                                 if (echoTailTimerRef.current) {
                                     clearTimeout(echoTailTimerRef.current);
@@ -1882,6 +1884,12 @@ ${combosCatalogForPrompt()}
                                         console.log(`[ORB] flip→respond (first chunk) t=${Date.now()}`);
                                         aiResponseInterruptedRef.current = false;
                                         isSpeaking.current = true;
+                                        // Imperative flip BEFORE setIsAiSpeaking so the orb
+                                        // animation is dispatched to the UI thread now —
+                                        // independent of the React re-render that
+                                        // setIsAiSpeaking will trigger (which the cart /
+                                        // messages tree can delay by 100s of ms).
+                                        visualizerRef.current?.flipTo('respond');
                                         setIsAiSpeaking(true);
                                         // Cancel any stale echo-tail timer left over from
                                         // the PREVIOUS turn — otherwise it fires inside
@@ -2471,6 +2479,7 @@ ${combosCatalogForPrompt()}
             if (streamingTurnEndedRef.current) {
                 streamingTurnEndedRef.current = false;
                 console.log(`[ORB] flip→listen (buffer drained) t=${Date.now()}`);
+                visualizerRef.current?.flipTo('listen');
                 setIsAiSpeaking(false);
                 if (echoTailTimerRef.current) clearTimeout(echoTailTimerRef.current);
                 echoTailTimerRef.current = setTimeout(() => {
@@ -2658,6 +2667,7 @@ ${combosCatalogForPrompt()}
                         // Visualizer flips back immediately so the orb collapse
                         // runs concurrently with the echo-tail window rather
                         // than after it. Mic gate stays armed inside the timer.
+                        visualizerRef.current?.flipTo('listen');
                         setIsAiSpeaking(false);
                         if (echoTailTimerRef.current) clearTimeout(echoTailTimerRef.current);
                         echoTailTimerRef.current = setTimeout(() => {

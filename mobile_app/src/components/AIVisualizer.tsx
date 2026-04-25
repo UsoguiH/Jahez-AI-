@@ -17,6 +17,7 @@ interface Props {
 
 export interface AIVisualizerHandle {
     forceListen: () => void;
+    flipTo: (state: 'listen' | 'respond') => void;
 }
 
 // Reference Figma values (Frame 3: bar width 61, gap 3, x targets [-96,-32,32,96]).
@@ -178,7 +179,99 @@ const AIVisualizer = forwardRef<AIVisualizerHandle, Props>(({ state }, ref) => {
         r1Opacity.value = withTiming(0, { duration: 200 });
     };
 
-    // ── Imperative API: snap to listening orb ──
+    // Idempotency guard. Both the React useEffect path AND the imperative
+    // flipTo path go through applyState; whichever fires first wins, the
+    // other becomes a no-op. This is what lets VoiceOverlay call flipTo
+    // BEFORE setIsAiSpeaking — the animation starts on the UI thread
+    // immediately, even if the React re-render that follows is delayed
+    // by cart/messages reconciliation.
+    const currentStateRef = useRef<'listen' | 'respond' | null>(null);
+
+    const transitionToListen = () => {
+        stopEqualizer();
+        const barsVisible = b0O.value > 0;
+
+        if (barsVisible) {
+            // Phase 1 — bars converge to center at uniform height (350ms).
+            const collapseDur = 350;
+            const innerDelay = 40;
+            for (let i = 0; i < 4; i++) {
+                cancelAnimation(bX[i]); cancelAnimation(bH[i]);
+                const d = (i === 1 || i === 2) ? innerDelay : 0;
+                bX[i].value = withDelay(d, withTiming(0, { duration: collapseDur, easing: expoInOut }));
+                bH[i].value = withDelay(d, withTiming(TALL_BAR_H, { duration: collapseDur, easing: expoInOut }, (finished) => {
+                    'worklet';
+                    if (!finished || i !== 3) return;
+                    for (let j = 0; j < 4; j++) bO[j].value = 0;
+                    cOpacity.value = 1;
+                    cW.value = BAR_WIDTH;
+                    cH.value = TALL_BAR_H;
+                    cR.value = BAR_WIDTH / 2;
+                    cScale.value = 1;
+                    cW.value = withTiming(CIRCLE_SIZE, { duration: 500, easing: backOut15 });
+                    cH.value = withTiming(CIRCLE_SIZE, { duration: 500, easing: backOut15 });
+                    cR.value = withTiming(CIRCLE_SIZE / 2, { duration: 500, easing: backOut15 }, (f) => {
+                        'worklet';
+                        if (f) runOnJS(startListeningFeedback)();
+                    });
+                }));
+            }
+        } else {
+            // Initial entry — fade circle in directly (400ms power4.out)
+            cOpacity.value = 1; cScale.value = 1;
+            cW.value = withTiming(CIRCLE_SIZE, { duration: 400, easing: power4Out });
+            cH.value = withTiming(CIRCLE_SIZE, { duration: 400, easing: power4Out });
+            cR.value = withTiming(CIRCLE_SIZE / 2, { duration: 400, easing: power4Out }, (f) => {
+                'worklet';
+                if (f) runOnJS(startListeningFeedback)();
+            });
+        }
+    };
+
+    const transitionToRespond = () => {
+        stopListeningFeedback();
+        cancelAnimation(cW); cancelAnimation(cH); cancelAnimation(cR);
+        cancelAnimation(cScale); cancelAnimation(cOpacity);
+
+        cW.value = withTiming(PILL_W, { duration: 180, easing: expoInOut });
+        cH.value = withTiming(PILL_H, { duration: 180, easing: expoInOut });
+        cScale.value = withTiming(1, { duration: 180, easing: expoInOut });
+        cR.value = withTiming(PILL_R, { duration: 180, easing: expoInOut }, (p1) => {
+            'worklet';
+            if (!p1) return;
+            cW.value = withTiming(BAR_WIDTH, { duration: 150, easing: expoIn });
+            cH.value = withTiming(TALL_BAR_H, { duration: 150, easing: expoIn });
+            cR.value = withTiming(BAR_WIDTH / 2, { duration: 150, easing: expoIn }, (p2) => {
+                'worklet';
+                if (!p2) return;
+                cOpacity.value = 0;
+                b0O.value = 1; b0X.value = 0; b0H.value = TALL_BAR_H;
+                b1O.value = 1; b1X.value = 0; b1H.value = TALL_BAR_H;
+                b2O.value = 1; b2X.value = 0; b2H.value = TALL_BAR_H;
+                b3O.value = 1; b3X.value = 0; b3H.value = TALL_BAR_H;
+                b0X.value = withTiming(X_TARGETS[0], { duration: 450, easing: backOut18 });
+                b0H.value = withTiming(BAR_BASE_HEIGHTS[0], { duration: 450, easing: backOut18 });
+                b1X.value = withDelay(30, withTiming(X_TARGETS[1], { duration: 450, easing: backOut18 }));
+                b1H.value = withDelay(30, withTiming(BAR_BASE_HEIGHTS[1], { duration: 450, easing: backOut18 }));
+                b2X.value = withDelay(60, withTiming(X_TARGETS[2], { duration: 450, easing: backOut18 }));
+                b2H.value = withDelay(60, withTiming(BAR_BASE_HEIGHTS[2], { duration: 450, easing: backOut18 }));
+                b3X.value = withDelay(90, withTiming(X_TARGETS[3], { duration: 450, easing: backOut18 }));
+                b3H.value = withDelay(90, withTiming(BAR_BASE_HEIGHTS[3], { duration: 450, easing: backOut18 }, (p3) => {
+                    'worklet';
+                    if (p3) runOnJS(startEqualizer)();
+                }));
+            });
+        });
+    };
+
+    const applyState = (s: 'listen' | 'respond') => {
+        if (currentStateRef.current === s) return;
+        currentStateRef.current = s;
+        if (s === 'listen') transitionToListen();
+        else transitionToRespond();
+    };
+
+    // ── Imperative API ──
     useImperativeHandle(ref, () => ({
         forceListen: () => {
             stopEqualizer();
@@ -192,94 +285,18 @@ const AIVisualizer = forwardRef<AIVisualizerHandle, Props>(({ state }, ref) => {
             cOpacity.value = 1;
             cW.value = CIRCLE_SIZE; cH.value = CIRCLE_SIZE; cR.value = CIRCLE_SIZE / 2;
             cScale.value = 1;
+            currentStateRef.current = 'listen';
             startListeningFeedback();
         },
+        flipTo: applyState,
     }));
 
-    // ── State transitions (timings match the GSAP reference exactly) ──
+    // React-driven path. When VoiceOverlay calls flipTo() before setIsAiSpeaking,
+    // currentStateRef has already been updated and applyState() bails on the
+    // duplicate. This effect just catches the case where state changes without
+    // an imperative call (e.g. initial mount).
     useEffect(() => {
-        if (state === 'listen') {
-            stopEqualizer();
-            const barsVisible = b0O.value > 0;
-
-            if (barsVisible) {
-                // Phase 1 — bars converge to center at uniform height (350ms).
-                // GSAP "stagger from edges" approximation: outer bars (0,3) start
-                // immediately, inner bars (1,2) start 40ms later (total spread 80ms).
-                const collapseDur = 350;
-                const innerDelay = 40;
-                for (let i = 0; i < 4; i++) {
-                    cancelAnimation(bX[i]); cancelAnimation(bH[i]);
-                    const d = (i === 1 || i === 2) ? innerDelay : 0;
-                    bX[i].value = withDelay(d, withTiming(0, { duration: collapseDur, easing: expoInOut }));
-                    bH[i].value = withDelay(d, withTiming(TALL_BAR_H, { duration: collapseDur, easing: expoInOut }, (finished) => {
-                        'worklet';
-                        if (!finished || i !== 3) return;
-                        // After last bar finishes, hand off to circle expansion
-                        for (let j = 0; j < 4; j++) bO[j].value = 0;
-                        cOpacity.value = 1;
-                        cW.value = BAR_WIDTH;
-                        cH.value = TALL_BAR_H;
-                        cR.value = BAR_WIDTH / 2;
-                        cScale.value = 1;
-                        // Phase 2 — circle expands (500ms back.out(1.5))
-                        cW.value = withTiming(CIRCLE_SIZE, { duration: 500, easing: backOut15 });
-                        cH.value = withTiming(CIRCLE_SIZE, { duration: 500, easing: backOut15 });
-                        cR.value = withTiming(CIRCLE_SIZE / 2, { duration: 500, easing: backOut15 }, (f) => {
-                            'worklet';
-                            if (f) runOnJS(startListeningFeedback)();
-                        });
-                    }));
-                }
-            } else {
-                // Initial entry — fade circle in directly (400ms power4.out)
-                cOpacity.value = 1; cScale.value = 1;
-                cW.value = withTiming(CIRCLE_SIZE, { duration: 400, easing: power4Out });
-                cH.value = withTiming(CIRCLE_SIZE, { duration: 400, easing: power4Out });
-                cR.value = withTiming(CIRCLE_SIZE / 2, { duration: 400, easing: power4Out }, (f) => {
-                    'worklet';
-                    if (f) runOnJS(startListeningFeedback)();
-                });
-            }
-        } else if (state === 'respond') {
-            stopListeningFeedback();
-            cancelAnimation(cW); cancelAnimation(cH); cancelAnimation(cR);
-            cancelAnimation(cScale); cancelAnimation(cOpacity);
-
-            // Phase 1 — circle squishes to pill (180ms expo.inOut)
-            cW.value = withTiming(PILL_W, { duration: 180, easing: expoInOut });
-            cH.value = withTiming(PILL_H, { duration: 180, easing: expoInOut });
-            cScale.value = withTiming(1, { duration: 180, easing: expoInOut });
-            cR.value = withTiming(PILL_R, { duration: 180, easing: expoInOut }, (p1) => {
-                'worklet';
-                if (!p1) return;
-                // Phase 2 — pill crunches into single tall bar (150ms expo.in)
-                cW.value = withTiming(BAR_WIDTH, { duration: 150, easing: expoIn });
-                cH.value = withTiming(TALL_BAR_H, { duration: 150, easing: expoIn });
-                cR.value = withTiming(BAR_WIDTH / 2, { duration: 150, easing: expoIn }, (p2) => {
-                    'worklet';
-                    if (!p2) return;
-                    // Hand-off: hide circle, reveal stacked bars at center
-                    cOpacity.value = 0;
-                    b0O.value = 1; b0X.value = 0; b0H.value = TALL_BAR_H;
-                    b1O.value = 1; b1X.value = 0; b1H.value = TALL_BAR_H;
-                    b2O.value = 1; b2X.value = 0; b2H.value = TALL_BAR_H;
-                    b3O.value = 1; b3X.value = 0; b3H.value = TALL_BAR_H;
-                    // Phase 3 — fan out to figma positions/heights (450ms back.out(1.8), 30ms stagger)
-                    b0X.value = withTiming(X_TARGETS[0], { duration: 450, easing: backOut18 });
-                    b0H.value = withTiming(BAR_BASE_HEIGHTS[0], { duration: 450, easing: backOut18 });
-                    b1X.value = withDelay(30, withTiming(X_TARGETS[1], { duration: 450, easing: backOut18 }));
-                    b1H.value = withDelay(30, withTiming(BAR_BASE_HEIGHTS[1], { duration: 450, easing: backOut18 }));
-                    b2X.value = withDelay(60, withTiming(X_TARGETS[2], { duration: 450, easing: backOut18 }));
-                    b2H.value = withDelay(60, withTiming(BAR_BASE_HEIGHTS[2], { duration: 450, easing: backOut18 }));
-                    b3X.value = withDelay(90, withTiming(X_TARGETS[3], { duration: 450, easing: backOut18 }));
-                    b3H.value = withDelay(90, withTiming(BAR_BASE_HEIGHTS[3], { duration: 450, easing: backOut18 }, (p3) => {
-                        'worklet';
-                        if (p3) runOnJS(startEqualizer)();
-                    }));
-                });
-            });
-        }
+        applyState(state);
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [state]);
 
