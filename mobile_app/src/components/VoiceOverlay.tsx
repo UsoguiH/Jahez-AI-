@@ -35,6 +35,7 @@ import {
     sendTranscribeChunk,
     TranscribeHandle,
 } from '../lib/transcribeSession';
+import { useSharedValue } from 'react-native-reanimated';
 // Hoisted from inside playAudioChunk — the dynamic import on first call was
 // costing ~50-100ms every time the AI started talking.
 import { appendWavHeader, computeAmplitudeEnvelope, computePeakEnvelopeFast } from '../lib/audioUtils';
@@ -97,7 +98,10 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
     const [showFullCart, setShowFullCart] = useState(false);
     const [showCheckout, setShowCheckout] = useState(false);
     const [chatReady, setChatReady] = useState(false);
-    const aiAmplitudeRef = useRef(0);
+    // Live AI-speech amplitude (0..1) consumed by AIVisualizer's UI-thread
+    // equalizer. SharedValue (not useRef) so the visualizer can read it inside
+    // a Reanimated worklet without bridge hops on every frame.
+    const aiAmplitudeShared = useSharedValue(0);
     const [suggestedRestaurants, setSuggestedRestaurants] = useState<{name_ar: string; name_en: string; id: string}[]>([]);
     const [activeRestaurantUI, setActiveRestaurantUI] = useState<Restaurant | null>(null);
     const scrollViewRef = useRef<ScrollView>(null);
@@ -777,7 +781,7 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
         visualizerRef.current?.forceListen();
 
         // Detach the sound's status callback BEFORE stopping, so a final status update
-        // can't flip isAiSpeaking back on or write to aiAmplitudeRef after we reset.
+        // can't flip isAiSpeaking back on or write to aiAmplitudeShared after we reset.
         const sound = currentSound.current;
         if (sound) {
             try { sound.setOnPlaybackStatusUpdate(null); } catch {}
@@ -785,7 +789,7 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
             try { await sound.unloadAsync(); } catch {}
             if (currentSound.current === sound) currentSound.current = null;
         }
-        aiAmplitudeRef.current = 0;
+        aiAmplitudeShared.value = 0;
 
         const socket = ws.current;
         const itemId = currentResponseItemIdRef.current;
@@ -2423,7 +2427,7 @@ ${combosCatalogForPrompt()}
                 // reverb don't trip server VAD back to the user. Coupling both
                 // to the same timeout was the ~2-second "visualizer still
                 // bouncing after AI stopped" lag.
-                aiAmplitudeRef.current = 0;
+                aiAmplitudeShared.value = 0;
                 setIsAiSpeaking(false);
                 if (echoTailTimerRef.current) clearTimeout(echoTailTimerRef.current);
                 echoTailTimerRef.current = setTimeout(() => {
@@ -2466,7 +2470,7 @@ ${combosCatalogForPrompt()}
         let newSound: Audio.Sound | null = null;
         // Envelope is computed AFTER playAsync resolves (see setTimeout below).
         // It starts empty so the first few progress ticks see length 0 and
-        // leave aiAmplitudeRef at 0 — by the time real amplitude kicks in
+        // leave aiAmplitudeShared at 0 — by the time real amplitude kicks in
         // (~10-20 ms after audio starts), the visualizer's procedural idle
         // animation is already moving the bars, so the transition looks
         // seamless. This ordering is what lets audio init be immediate while
@@ -2516,16 +2520,16 @@ ${combosCatalogForPrompt()}
                         playbackPositionMsRef.current = status.positionMillis;
                         // Drive the visualizer bars from the real envelope.
                         // If the envelope hasn't been computed yet (first few
-                        // ticks after playAsync), amplitudeRef stays at 0 and
+                        // ticks after playAsync), amplitude stays at 0 and
                         // the visualizer falls through to its idle procedural
                         // animation — zero visual glitch during the handover.
                         if (envelope.length > 0) {
                             const idx = Math.floor((status.positionMillis / 1000) * envelopeFps);
-                            aiAmplitudeRef.current = envelope[idx] ?? 0;
+                            aiAmplitudeShared.value = envelope[idx] ?? 0;
                         }
                     }
                     if (status.didJustFinish) {
-                        aiAmplitudeRef.current = 0;
+                        aiAmplitudeShared.value = 0;
                         playbackPositionMsRef.current = 0;
                         try { newSound!.unloadAsync(); } catch {}
                         if (currentSound.current === newSound) currentSound.current = null;
@@ -2606,10 +2610,10 @@ ${combosCatalogForPrompt()}
                     if (status.isPlaying && !status.didJustFinish) {
                         playbackPositionMsRef.current = status.positionMillis;
                         const idx = Math.floor((status.positionMillis / 1000) * envelopeFps);
-                        aiAmplitudeRef.current = envelope[idx] ?? 0;
+                        aiAmplitudeShared.value = envelope[idx] ?? 0;
                     }
                     if (status.didJustFinish) {
-                        aiAmplitudeRef.current = 0;
+                        aiAmplitudeShared.value = 0;
                         playbackPositionMsRef.current = 0;
                         currentResponseItemIdRef.current = null;
                         newSound.unloadAsync();
@@ -2924,7 +2928,7 @@ ${combosCatalogForPrompt()}
 
                     {/* AI Audio Visualizer — circle (listening) ↔ bars (responding, driven by live AI audio) */}
                     {chatReady && (
-                        <AIVisualizer ref={visualizerRef} state={isAiSpeaking ? 'respond' : 'listen'} amplitudeRef={aiAmplitudeRef} />
+                        <AIVisualizer ref={visualizerRef} state={isAiSpeaking ? 'respond' : 'listen'} amplitudeShared={aiAmplitudeShared} />
                     )}
                 </Animated.View>
 
