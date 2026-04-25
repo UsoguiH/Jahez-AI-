@@ -1,5 +1,5 @@
 import React, { useEffect, useRef } from 'react';
-import { View, Text, TouchableOpacity, Animated, ScrollView, Image, Easing } from 'react-native';
+import { View, Text, TouchableOpacity, Animated, Image } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { CartItem } from './OrderCartWidget';
 import { getRestaurantLogo } from '../lib/restaurantLogos';
@@ -12,6 +12,7 @@ interface InlineCartWidgetProps {
 }
 
 const VAT_RATE = 0.15;
+const MAX_VISIBLE_ITEMS = 3;
 
 const getFoodImage = (nameEn: string): string => {
     const n = nameEn.toLowerCase();
@@ -38,206 +39,155 @@ const getFoodImage = (nameEn: string): string => {
     return 'https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=200&h=200&fit=crop';
 };
 
-// Apple's "emphasized decelerate" curve — starts fast, settles long. Used
-// by iOS, Material 3 expressive, Linear, and Arc. The defining feel of a
-// "premium" entrance vs. the generic ease-out that feels like a stock demo.
-const EMPHASIZED_OUT = Easing.bezier(0.16, 1, 0.3, 1);
-
-// Single cart row with its own mount animation. Keyed by item identity so
-// React mounts a fresh CartRow whenever a new item is added; only that row
-// runs its entrance animation. `delayMs` cascades rows on the initial widget
-// reveal (first-render stagger) but is 0 for every later single-item add.
+// Compact item row — RTL: image leads on the right, stepper on the left.
 const CartRow: React.FC<{
     item: CartItem;
-    idx: number;
     isLast: boolean;
-    delayMs: number;
     onIncrement: () => void;
     onDecrement: () => void;
-}> = ({ item, isLast, delayMs, onIncrement, onDecrement }) => {
-    const rowOpacity = useRef(new Animated.Value(0)).current;
-    // +40px translateX = slide in from the RIGHT (RTL arrival direction,
-    // since Arabic reads right→left the item feels like it walks in from
-    // its "natural" side). Big enough distance to actually be visible.
-    const rowTranslate = useRef(new Animated.Value(40)).current;
-    // Image scales from 0.6 up with a slight overshoot — the only springy
-    // element in the widget. Confined to a 52x52 Image so GPU cost is
-    // negligible even on weak phones, but it gives the row a "landed"
-    // physical feel (Airbnb listing card, Apple Wallet pass feel).
-    const imgScale = useRef(new Animated.Value(0.6)).current;
-
-    useEffect(() => {
-        Animated.parallel([
-            Animated.timing(rowOpacity, {
-                toValue: 1,
-                duration: 460,
-                delay: delayMs,
-                easing: EMPHASIZED_OUT,
-                useNativeDriver: true,
-            }),
-            Animated.timing(rowTranslate, {
-                toValue: 0,
-                duration: 520,
-                delay: delayMs,
-                easing: EMPHASIZED_OUT,
-                useNativeDriver: true,
-            }),
-            Animated.spring(imgScale, {
-                toValue: 1,
-                delay: delayMs + 80,
-                tension: 180,
-                friction: 10,
-                useNativeDriver: true,
-            }),
-        ]).start();
-    }, []);
-
+}> = ({ item, isLast, onIncrement, onDecrement }) => {
     return (
-        <Animated.View style={{ opacity: rowOpacity, transform: [{ translateX: rowTranslate }] }}>
+        <View>
             <View style={{
                 flexDirection: 'row',
-                justifyContent: 'space-between',
                 alignItems: 'center',
-                paddingVertical: 10,
+                paddingVertical: 8,
             }}>
-                {/* Stepper Pill (left in RTL) */}
+                {/* Stepper pill (LEFT in the row — action edge in RTL) */}
                 <View style={{
-                    backgroundColor: '#F2F2F7',
-                    borderRadius: 20,
                     flexDirection: 'row',
                     alignItems: 'center',
-                    justifyContent: 'space-between',
-                    padding: 3,
-                    width: 90,
+                    backgroundColor: '#F5F5F7',
+                    borderRadius: 16,
+                    paddingHorizontal: 3,
+                    height: 30,
                 }}>
-                    <TouchableOpacity
-                        onPress={onIncrement}
-                        style={{ width: 26, height: 26, alignItems: 'center', justifyContent: 'center' }}
-                    >
-                        <Ionicons name="add" size={15} color="#1D1D1F" />
-                    </TouchableOpacity>
-
-                    <View style={{
-                        width: 24,
-                        height: 24,
-                        borderRadius: 12,
-                        backgroundColor: '#E31837',
-                        alignItems: 'center',
-                        justifyContent: 'center',
-                        shadowColor: '#E31837',
-                        shadowOffset: { width: 0, height: 3 },
-                        shadowOpacity: 0.35,
-                        shadowRadius: 6,
-                        elevation: 4,
-                    }}>
-                        <Text style={{ color: 'white', fontSize: 11, fontWeight: '700' }}>
-                            {item.quantity}
-                        </Text>
-                    </View>
-
                     <TouchableOpacity
                         onPress={onDecrement}
                         style={{ width: 26, height: 26, alignItems: 'center', justifyContent: 'center' }}
                     >
-                        {item.quantity <= 1 ? (
-                            <Ionicons name="trash-outline" size={14} color="#1D1D1F" />
-                        ) : (
-                            <Ionicons name="remove" size={15} color="#1D1D1F" />
-                        )}
+                        <Ionicons
+                            name={item.quantity <= 1 ? 'trash-outline' : 'remove'}
+                            size={13}
+                            color="#1D1D1F"
+                        />
+                    </TouchableOpacity>
+                    <Text style={{
+                        fontSize: 12,
+                        fontWeight: '700',
+                        color: '#1D1D1F',
+                        minWidth: 16,
+                        textAlign: 'center',
+                    }}>
+                        {item.quantity}
+                    </Text>
+                    <TouchableOpacity
+                        onPress={onIncrement}
+                        style={{ width: 26, height: 26, alignItems: 'center', justifyContent: 'center' }}
+                    >
+                        <Ionicons name="add" size={13} color="#1D1D1F" />
                     </TouchableOpacity>
                 </View>
 
-                <View style={{ flex: 1, alignItems: 'flex-end', marginLeft: 12 }}>
-                    <Text style={{ fontSize: 14, fontWeight: '700', color: '#1D1D1F', textAlign: 'right' }}>
+                {/* Name + price (middle) */}
+                <View style={{ flex: 1, alignItems: 'flex-end', marginHorizontal: 9 }}>
+                    <Text
+                        style={{ fontSize: 13, fontWeight: '700', color: '#1D1D1F', textAlign: 'right' }}
+                        numberOfLines={1}
+                    >
                         {item.name_ar}
                     </Text>
                     {item.notes ? (
                         <Text style={{
-                            fontSize: 12,
+                            fontSize: 10,
                             fontWeight: '600',
                             color: item.notes.includes('بدون') ? '#FF3B30' : '#34C759',
                             textAlign: 'right',
-                            marginTop: 2,
-                        }}>
+                            marginTop: 1,
+                        }} numberOfLines={1}>
                             {item.notes}
                         </Text>
                     ) : null}
-                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 3, marginTop: 3 }}>
-                        <Text style={{ fontSize: 14, fontWeight: '800', color: '#1D1D1F' }}>﷼</Text>
-                        <Text style={{ fontSize: 15, fontWeight: '800', color: '#1D1D1F' }}>
-                            {(item.unit_price * item.quantity).toFixed(2)}
-                        </Text>
-                    </View>
+                    <Text style={{
+                        fontSize: 12,
+                        fontWeight: '600',
+                        color: '#6B6B70',
+                        marginTop: 2,
+                    }}>
+                        {(item.unit_price * item.quantity).toFixed(2)} ر.س
+                    </Text>
                 </View>
 
-                <Animated.View style={{ transform: [{ scale: imgScale }], marginLeft: 10 }}>
-                    <Image
-                        source={{ uri: getFoodImage(item.name_en) }}
-                        style={{
-                            width: 52,
-                            height: 52,
-                            borderRadius: 14,
-                            backgroundColor: '#fff',
-                        }}
-                        resizeMode="cover"
-                    />
-                </Animated.View>
+                {/* Image (RIGHT — leading edge in RTL) */}
+                <Image
+                    source={{ uri: getFoodImage(item.name_en) }}
+                    style={{
+                        width: 44,
+                        height: 44,
+                        borderRadius: 11,
+                        backgroundColor: '#F5F5F7',
+                    }}
+                    resizeMode="cover"
+                />
             </View>
 
             {!isLast && (
-                <View style={{ height: 0.5, backgroundColor: '#F0F0F0', width: '100%' }} />
+                <View style={{ height: 0.5, backgroundColor: '#F0F0F0' }} />
             )}
-        </Animated.View>
+        </View>
+    );
+};
+
+// Stack of overlapping mini-thumbs for the "+N more items" row.
+const StackedThumbs: React.FC<{ items: CartItem[] }> = ({ items }) => {
+    const shown = items.slice(0, 2);
+    return (
+        <View style={{ flexDirection: 'row', width: 44, height: 44, alignItems: 'center', justifyContent: 'flex-end' }}>
+            {shown.map((it, i) => (
+                <Image
+                    key={`${it.name_en}-${i}`}
+                    source={{ uri: getFoodImage(it.name_en) }}
+                    style={{
+                        width: 32,
+                        height: 32,
+                        borderRadius: 9,
+                        backgroundColor: '#F5F5F7',
+                        position: 'absolute',
+                        // First thumb on right, second offset to the left so it
+                        // peeks out behind — natural RTL stack.
+                        right: i * 12,
+                        zIndex: shown.length - i,
+                        borderWidth: 1.5,
+                        borderColor: '#FFFFFF',
+                    }}
+                    resizeMode="cover"
+                />
+            ))}
+        </View>
     );
 };
 
 const InlineCartWidget: React.FC<InlineCartWidgetProps> = ({ items, restaurantName, onShowCart, onItemsChange }) => {
+    // Single fast fade — the user wants the cart to appear immediately when
+    // the AI confirms the order, not cascade in. 150 ms is enough to avoid a
+    // hard pop-in but short enough to feel instant.
     const fadeAnim = useRef(new Animated.Value(0)).current;
-    // 32px rise from below is big enough to clearly read as "the card just
-    // arrived" rather than "the card was always there with a brief fade".
-    const slideAnim = useRef(new Animated.Value(32)).current;
-    // 0.92 start scale — bigger than 0.96 so the "focusing in" motion is
-    // actually visible. Still small enough to not feel like a zoom-in pop.
-    const scaleAnim = useRef(new Animated.Value(0.92)).current;
-
-    // Capture whether this render is the very first one. Used to decide
-    // whether rows should cascade in (first mount) or appear instantly
-    // (user added a single new item to an already-visible cart).
-    const isFirstRenderRef = useRef(true);
-    const isFirstRender = isFirstRenderRef.current;
-    useEffect(() => { isFirstRenderRef.current = false; }, []);
-
-    // Container reveal: fade + 14px rise + soft scale from 0.96. The scale
-    // is the secret sauce — too small to read as "zoom in" but enough to
-    // feel like the card is "focusing in" instead of just appearing flat.
-    // Emphasized-out curve so it lands cleanly without a spring bounce.
     useEffect(() => {
-        Animated.parallel([
-            Animated.timing(fadeAnim, {
-                toValue: 1,
-                duration: 500,
-                easing: EMPHASIZED_OUT,
-                useNativeDriver: true,
-            }),
-            Animated.timing(slideAnim, {
-                toValue: 0,
-                duration: 560,
-                easing: EMPHASIZED_OUT,
-                useNativeDriver: true,
-            }),
-            Animated.timing(scaleAnim, {
-                toValue: 1,
-                duration: 560,
-                easing: EMPHASIZED_OUT,
-                useNativeDriver: true,
-            }),
-        ]).start();
+        Animated.timing(fadeAnim, {
+            toValue: 1,
+            duration: 150,
+            useNativeDriver: true,
+        }).start();
     }, []);
 
     if (items.length === 0) return null;
 
     const subtotal = items.reduce((sum, item) => sum + (item.unit_price * item.quantity), 0);
-    const total = subtotal + (subtotal * VAT_RATE);
+    const vatAmount = subtotal * VAT_RATE;
+    const total = subtotal + vatAmount;
+    const visibleItems = items.slice(0, MAX_VISIBLE_ITEMS);
+    const hiddenItems = items.slice(MAX_VISIBLE_ITEMS);
+    const logo = getRestaurantLogo(restaurantName || '');
 
     const handleIncrement = (idx: number) => {
         if (!onItemsChange) return;
@@ -261,76 +211,154 @@ const InlineCartWidget: React.FC<InlineCartWidgetProps> = ({ items, restaurantNa
         <Animated.View
             style={{
                 opacity: fadeAnim,
-                transform: [{ translateY: slideAnim }, { scale: scaleAnim }],
                 alignSelf: 'flex-start',
-                width: '88%',
-                marginBottom: 30,
+                width: '85%',
+                marginBottom: 24,
             }}
         >
             <View style={{
-                backgroundColor: 'rgba(255, 255, 255, 0.95)',
-                borderRadius: 28,
-                padding: 20,
+                backgroundColor: '#FFFFFF',
+                borderRadius: 20,
+                paddingHorizontal: 14,
+                paddingTop: 12,
+                paddingBottom: 12,
                 shadowColor: '#000',
-                shadowOffset: { width: 0, height: 8 },
-                shadowRadius: 24,
-                elevation: 10,
+                shadowOffset: { width: 0, height: 5 },
+                shadowOpacity: 0.08,
+                shadowRadius: 16,
+                elevation: 6,
                 borderWidth: 0.5,
-                borderColor: 'rgba(255,255,255,0.9)',
+                borderColor: '#EFEFF1',
             }}>
-                {/* Items */}
-                <ScrollView style={{ maxHeight: 220 }} showsVerticalScrollIndicator={false} nestedScrollEnabled={true}>
-                    <View style={{ gap: 0 }}>
-                        {items.map((item, idx) => (
-                            <CartRow
-                                key={`${item.name_en}-${item.notes || ''}`}
-                                item={item}
-                                idx={idx}
-                                isLast={idx === items.length - 1}
-                                // First render: 180ms head-start lets the
-                                // container settle, then 85ms stagger between
-                                // rows — slow enough to actually *see* the
-                                // cascade. Later adds: 0ms (new row appears
-                                // immediately, no fake one-row cascade).
-                                delayMs={isFirstRender ? 180 + idx * 85 : 0}
-                                onIncrement={() => handleIncrement(idx)}
-                                onDecrement={() => handleDecrement(idx)}
-                            />
-                        ))}
+                {/* Header — pencil (LEFT) | tax info + restaurant name | logo (RIGHT) */}
+                <View style={{ flexDirection: 'row', alignItems: 'center', paddingVertical: 3 }}>
+                    <TouchableOpacity
+                        onPress={onShowCart}
+                        style={{ padding: 5 }}
+                        hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                    >
+                        <Ionicons name="create-outline" size={17} color="#8E8E93" />
+                    </TouchableOpacity>
+
+                    <View style={{ flex: 1, alignItems: 'flex-end', marginHorizontal: 9 }}>
+                        <Text
+                            style={{ fontSize: 15, fontWeight: '800', color: '#1D1D1F', textAlign: 'right' }}
+                            numberOfLines={1}
+                        >
+                            {restaurantName || 'سلتك'}
+                        </Text>
+                        <Text style={{ fontSize: 10, color: '#8E8E93', textAlign: 'right', marginTop: 1 }}>
+                            شامل ضريبة القيمة المضافة 15%
+                        </Text>
                     </View>
-                </ScrollView>
 
-                {/* Divider before total */}
-                <View style={{ height: 0.5, backgroundColor: '#E5E5EA', marginTop: 8, marginBottom: 12 }} />
-
-                {/* Total */}
-                <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
-                    <Text style={{ fontSize: 19, fontWeight: '800', color: '#D71920' }}>
-                        {total.toFixed(2)} ر.س
-                    </Text>
-                    <Text style={{ fontSize: 19, fontWeight: '800', color: '#1D1D1F', textAlign: 'right' }}>
-                        المجموع الكلي
-                    </Text>
+                    {logo ? (
+                        <Image
+                            source={logo}
+                            style={{
+                                width: 42,
+                                height: 42,
+                                borderRadius: 11,
+                                backgroundColor: '#F5F5F7',
+                            }}
+                            resizeMode="contain"
+                        />
+                    ) : (
+                        <View style={{
+                            width: 42,
+                            height: 42,
+                            borderRadius: 11,
+                            backgroundColor: '#FFE5E5',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                        }}>
+                            <Ionicons name="restaurant" size={20} color="#FF3B30" />
+                        </View>
+                    )}
                 </View>
 
-                {/* عرض الطلب Button */}
+                <View style={{ height: 0.5, backgroundColor: '#F0F0F0', marginTop: 9, marginBottom: 2 }} />
+
+                {/* Items */}
+                {visibleItems.map((item, idx) => (
+                    <CartRow
+                        key={`${item.name_en}-${item.notes || ''}-${idx}`}
+                        item={item}
+                        isLast={idx === visibleItems.length - 1 && hiddenItems.length === 0}
+                        onIncrement={() => handleIncrement(idx)}
+                        onDecrement={() => handleDecrement(idx)}
+                    />
+                ))}
+
+                {/* +N more items row */}
+                {hiddenItems.length > 0 && (
+                    <TouchableOpacity
+                        onPress={onShowCart}
+                        activeOpacity={0.7}
+                        style={{
+                            flexDirection: 'row',
+                            alignItems: 'center',
+                            paddingVertical: 8,
+                        }}
+                    >
+                        <View style={{ flex: 1, alignItems: 'flex-end', marginHorizontal: 9 }}>
+                            <Text style={{
+                                fontSize: 12,
+                                fontWeight: '700',
+                                color: '#1D1D1F',
+                                textAlign: 'right',
+                                textDecorationLine: 'underline',
+                            }}>
+                                +{hiddenItems.length} {hiddenItems.length === 1 ? 'منتج آخر' : 'منتجات أخرى'}
+                            </Text>
+                        </View>
+                        <StackedThumbs items={hiddenItems} />
+                    </TouchableOpacity>
+                )}
+
+                <View style={{ height: 0.5, backgroundColor: '#F0F0F0', marginTop: 5, marginBottom: 10 }} />
+
+                {/* Footer — total (LEFT) | delivery info (RIGHT) */}
+                <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-end', marginBottom: 12 }}>
+                    <View style={{ alignItems: 'flex-start' }}>
+                        <Text style={{ fontSize: 11, color: '#8E8E93', fontWeight: '600' }}>
+                            الإجمالي
+                        </Text>
+                        <Text style={{ fontSize: 17, fontWeight: '800', color: '#1D1D1F', marginTop: 2 }}>
+                            {total.toFixed(2)} ر.س
+                        </Text>
+                    </View>
+
+                    <View style={{ alignItems: 'flex-end' }}>
+                        <Text style={{ fontSize: 11, color: '#1D1D1F', fontWeight: '700', textAlign: 'right' }}>
+                            التوصيل خلال ٣٠ دقيقة
+                        </Text>
+                        <Text style={{ fontSize: 10, color: '#8E8E93', textAlign: 'right', marginTop: 1 }}>
+                            الموقع الحالي
+                        </Text>
+                    </View>
+                </View>
+
+                {/* Big primary button — same red as تأكيد الطلب */}
                 <TouchableOpacity
                     onPress={onShowCart}
-                    activeOpacity={0.85}
+                    activeOpacity={0.88}
                     style={{
                         backgroundColor: '#FF3B30',
-                        paddingVertical: 16,
-                        borderRadius: 16,
+                        paddingVertical: 13,
+                        borderRadius: 999,
                         alignItems: 'center',
-                        marginTop: 16,
+                        justifyContent: 'center',
                         shadowColor: '#FF3B30',
-                        shadowOffset: { width: 0, height: 4 },
-                        shadowOpacity: 0.3,
-                        shadowRadius: 8,
-                        elevation: 8,
+                        shadowOffset: { width: 0, height: 3 },
+                        shadowOpacity: 0.27,
+                        shadowRadius: 7,
+                        elevation: 5,
                     }}
                 >
-                    <Text style={{ color: 'white', fontSize: 18, fontWeight: '800' }}>عرض الطلب</Text>
+                    <Text style={{ color: 'white', fontSize: 14, fontWeight: '800' }}>
+                        إتمام الطلب
+                    </Text>
                 </TouchableOpacity>
             </View>
         </Animated.View>

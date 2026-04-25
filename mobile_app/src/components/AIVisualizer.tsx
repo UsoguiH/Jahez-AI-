@@ -369,14 +369,17 @@ const AIVisualizer = forwardRef<AIVisualizerHandle, Props>(({ state, amplitudeSh
                 cancelAnimation(b0X); cancelAnimation(b1X); cancelAnimation(b2X); cancelAnimation(b3X);
                 cancelAnimation(b0H); cancelAnimation(b1H); cancelAnimation(b2H); cancelAnimation(b3H);
 
-                b0X.value = withTiming(0, { duration: 350, easing: collapseEasing });
-                b1X.value = withTiming(0, { duration: 350, easing: collapseEasing });
-                b2X.value = withTiming(0, { duration: 350, easing: collapseEasing });
-                b3X.value = withTiming(0, { duration: 350, easing: collapseEasing });
-                b0H.value = withTiming(TALL_BAR_H, { duration: 350, easing: collapseEasing });
-                b1H.value = withTiming(TALL_BAR_H, { duration: 350, easing: collapseEasing });
-                b2H.value = withTiming(TALL_BAR_H, { duration: 350, easing: collapseEasing });
-                b3H.value = withTiming(TALL_BAR_H, { duration: 350, easing: collapseEasing }, (finished) => {
+                // Snappy collapse — was 350ms, now 180ms — so the orb visibly
+                // reacts to "AI stopped" almost instantly. Full respond→listen
+                // transition is now ~430ms (collapse 180 + expand 250) vs 850ms.
+                b0X.value = withTiming(0, { duration: 180, easing: collapseEasing });
+                b1X.value = withTiming(0, { duration: 180, easing: collapseEasing });
+                b2X.value = withTiming(0, { duration: 180, easing: collapseEasing });
+                b3X.value = withTiming(0, { duration: 180, easing: collapseEasing });
+                b0H.value = withTiming(TALL_BAR_H, { duration: 180, easing: collapseEasing });
+                b1H.value = withTiming(TALL_BAR_H, { duration: 180, easing: collapseEasing });
+                b2H.value = withTiming(TALL_BAR_H, { duration: 180, easing: collapseEasing });
+                b3H.value = withTiming(TALL_BAR_H, { duration: 180, easing: collapseEasing }, (finished) => {
                     'worklet';
                     if (!finished) return;
 
@@ -388,9 +391,9 @@ const AIVisualizer = forwardRef<AIVisualizerHandle, Props>(({ state, amplitudeSh
                     circleR.value = BAR_WIDTH / 2;
                     circleScale.value = 1;
 
-                    circleW.value = withTiming(CIRCLE_SIZE, { duration: 500, easing: easeBackOut15 });
-                    circleH.value = withTiming(CIRCLE_SIZE, { duration: 500, easing: easeBackOut15 });
-                    circleR.value = withTiming(CIRCLE_SIZE / 2, { duration: 500, easing: easeBackOut15 }, (f) => {
+                    circleW.value = withTiming(CIRCLE_SIZE, { duration: 250, easing: easeBackOut15 });
+                    circleH.value = withTiming(CIRCLE_SIZE, { duration: 250, easing: easeBackOut15 });
+                    circleR.value = withTiming(CIRCLE_SIZE / 2, { duration: 250, easing: easeBackOut15 }, (f) => {
                         'worklet';
                         if (f) runOnJS(startListeningFeedback)();
                     });

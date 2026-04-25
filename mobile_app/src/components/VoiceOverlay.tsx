@@ -198,6 +198,24 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
     // First batch threshold ≈ 400ms of 24kHz PCM16. Larger = smoother start/less
     // under-run risk; smaller = snappier first-audio latency. 400ms is our sweet spot.
     const STREAM_FIRST_BATCH_MIN_B64 = 12800;
+    // True once the silence watchdog has already flipped the orb to listen
+    // for this turn. Prevents the buffer-drain fallback path from flipping
+    // a second time.
+    const earlyListenFlipDoneRef = useRef<boolean>(false);
+    // Vocal-detection threshold for real-time end-of-speech. Anything below
+    // this in the playback envelope is considered silence.
+    const VOCAL_AMP_THRESHOLD = 0.06;
+    // Wall-clock timestamp of the last inlineData audio chunk we received
+    // from Gemini. Used by the orb-state controller as a "still alive" signal
+    // during the ~500-800 ms window between first chunk arriving and audio
+    // actually starting to play — without it, the controller sees amp=0 and
+    // false-flips to listen before any sound has been heard.
+    const lastChunkAtRef = useRef<number>(0);
+    // Gemini's last batch often has up to ~250ms of trailing silence padding,
+    // and natural inter-word pauses can hit ~200ms. 350ms is the smallest
+    // gap that reliably means "AI is done speaking" without false-flipping
+    // mid-sentence.
+    const SILENCE_FLIP_MS = 350;
 
     // Restaurant menu data — pre-loaded on mic open for zero latency
     const restaurantsRef = useRef<Restaurant[]>([]);
@@ -211,6 +229,84 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
     // the async nature of setState making it see stale values.
     const cartItemsRef = useRef<CartItem[]>([]);
     useEffect(() => { cartItemsRef.current = cartItems; }, [cartItems]);
+
+    // ── Continuous orb-state controller ────────────────────────────────────
+    // Permanently-running 50 ms loop that drives the orb state purely from
+    // real-time AI amplitude. No coupling to audio buffers, batches, or
+    // turnComplete signals — those were all unreliable timing sources.
+    //
+    // Rules:
+    //   • If amp > VOCAL_AMP_THRESHOLD continuously for ≥ 80 ms → respond.
+    //   • If amp ≤ VOCAL_AMP_THRESHOLD continuously for ≥ 500 ms → listen.
+    //
+    // 500 ms silence rides over inter-word and inter-phrase gaps (typically
+    // < 400 ms) without false-flipping mid-sentence. 80 ms vocal-onset
+    // debounce protects against a single noisy peak retriggering respond.
+    //
+    // The controller is also allowed to flip back to respond if amp resumes
+    // after an early listen-flip (e.g. AI takes a long breath, then keeps
+    // talking) — so it's self-correcting, not a one-shot.
+    // Mirror of isAiSpeaking React state, readable from the polling loop
+    // below without re-creating the interval on every change.
+    const isAiSpeakingRef = useRef(false);
+    useEffect(() => { isAiSpeakingRef.current = isAiSpeaking; }, [isAiSpeaking]);
+
+    useEffect(() => {
+        let silenceStartTs = 0;
+        let vocalStartTs = 0;
+        const VOCAL_DEBOUNCE_MS = 80;
+        const SILENCE_HANG_MS = 500;
+        const interval = setInterval(() => {
+            if (aiResponseInterruptedRef.current) {
+                silenceStartTs = 0;
+                vocalStartTs = 0;
+                return;
+            }
+            const amp = aiAmplitudeShared.value;
+            const now = Date.now();
+            const orbSpeaking = isAiSpeakingRef.current;
+
+            if (amp > VOCAL_AMP_THRESHOLD) {
+                silenceStartTs = 0;
+                if (vocalStartTs === 0) vocalStartTs = now;
+                if (!orbSpeaking && (now - vocalStartTs) >= VOCAL_DEBOUNCE_MS) {
+                    console.log(`[ORB-CTRL] flip→respond (vocal ${now - vocalStartTs}ms) t=${now}`);
+                    isSpeaking.current = true;
+                    setIsAiSpeaking(true);
+                    if (echoTailTimerRef.current) {
+                        clearTimeout(echoTailTimerRef.current);
+                        echoTailTimerRef.current = null;
+                    }
+                }
+            } else {
+                vocalStartTs = 0;
+                if (silenceStartTs === 0) silenceStartTs = now;
+                // Bootstrap guard: if Gemini sent us an audio chunk in the
+                // last 800 ms but it hasn't started playing yet (envelope
+                // not computed → amp=0), DON'T flip to listen. This is the
+                // gap between "first chunk arrives" and "audio.playAsync
+                // resolves and the first envelope tick fires."
+                const sinceChunk = now - lastChunkAtRef.current;
+                const inBootstrapWindow = lastChunkAtRef.current > 0 && sinceChunk < 800;
+                if (orbSpeaking
+                    && !inBootstrapWindow
+                    && (now - silenceStartTs) >= SILENCE_HANG_MS) {
+                    console.log(`[ORB-CTRL] flip→listen (silence ${now - silenceStartTs}ms, sinceChunk ${sinceChunk}ms) t=${now}`);
+                    aiAmplitudeShared.value = 0;
+                    earlyListenFlipDoneRef.current = true;
+                    setIsAiSpeaking(false);
+                    if (echoTailTimerRef.current) clearTimeout(echoTailTimerRef.current);
+                    echoTailTimerRef.current = setTimeout(() => {
+                        echoTailTimerRef.current = null;
+                        console.log(`[ORB-CTRL] echo-tail elapsed t=${Date.now()}`);
+                        isSpeaking.current = false;
+                    }, 600);
+                }
+            }
+        }, 50);
+        return () => clearInterval(interval);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
 
     // Animation Values
     const pulseAnim = useRef(new Animated.Value(1)).current;
@@ -1889,6 +1985,9 @@ ${combosCatalogForPrompt()}
                                         aiResponseInterruptedRef.current = false;
                                         isSpeaking.current = true;
                                         setIsAiSpeaking(true);
+                                        // New turn — re-arm the silence watchdog so the
+                                        // real-time orb transition runs again.
+                                        earlyListenFlipDoneRef.current = false;
                                         // Cancel any stale echo-tail timer left over from
                                         // the PREVIOUS turn — otherwise it fires inside
                                         // THIS turn and wrongly opens the mic to echo.
@@ -1899,6 +1998,10 @@ ${combosCatalogForPrompt()}
                                     }
                                     audioBuffer.current += part.inlineData.data;
                                     streamingPendingRef.current += part.inlineData.data;
+                                    // Heartbeat for the orb-state controller —
+                                    // proves the AI is actively producing audio
+                                    // even before the first audio frame plays.
+                                    lastChunkAtRef.current = Date.now();
                                     // Start playback as soon as first batch threshold is
                                     // met. Subsequent chunks are picked up automatically
                                     // by the recursive playPendingStreamAudio chain.
@@ -2471,19 +2574,22 @@ ${combosCatalogForPrompt()}
             return;
         }
         if (streamingPendingRef.current.length === 0) {
-            // Nothing queued. If the turn is over, arm the echo-tail grace period
-            // so the mic re-opens AFTER the device speaker's tail has decayed.
+            // Nothing queued. If the turn is over, finalize the orb/mic state.
             if (streamingTurnEndedRef.current) {
                 streamingTurnEndedRef.current = false;
-                // Flip the visualizer back to 'listen' IMMEDIATELY so the orb
-                // starts collapsing the moment audio actually ends. The mic
-                // echo-tail gate (isSpeaking.current) is a separate concern —
-                // it stays armed for 600 ms so the device-speaker tail and room
-                // reverb don't trip server VAD back to the user. Coupling both
-                // to the same timeout was the ~2-second "visualizer still
-                // bouncing after AI stopped" lag.
+                if (earlyListenFlipDoneRef.current) {
+                    // The envelope-driven early-flip already collapsed the orb
+                    // and armed the echo-tail timer when the voice actually
+                    // ended. Nothing left to do here — bailing out prevents a
+                    // redundant second flip and a doubled echo-tail timer.
+                    console.log(`[ORB] flip→listen skipped (already early-flipped) t=${Date.now()}`);
+                    return;
+                }
+                // Fallback path: no envelope was ever computed (very short
+                // batch, or playback ended before envelope kicked in). Flip
+                // the orb here so we don't get stuck in 'respond'.
                 aiAmplitudeShared.value = 0;
-                console.log(`[ORB] flip→listen t=${Date.now()}`);
+                console.log(`[ORB] flip→listen (fallback, buffer drained) t=${Date.now()}`);
                 setIsAiSpeaking(false);
                 if (echoTailTimerRef.current) clearTimeout(echoTailTimerRef.current);
                 echoTailTimerRef.current = setTimeout(() => {
@@ -2592,6 +2698,10 @@ ${combosCatalogForPrompt()}
                             const idx = Math.floor((status.positionMillis / 1000) * envelopeFps);
                             aiAmplitudeShared.value = envelope[idx] ?? 0;
                         }
+                        // The orb-flip decision lives in the silence watchdog
+                        // useEffect below — decoupled from this callback so it
+                        // keeps polling even between batches and even when this
+                        // sound's progress updates have a gap.
                     }
                     if (status.didJustFinish) {
                         console.log(`[BATCH] didJustFinish t=${Date.now()} pendLen=${streamingPendingRef.current.length} turnEnded=${streamingTurnEndedRef.current}`);
