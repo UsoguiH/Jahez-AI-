@@ -78,20 +78,18 @@ const AnimatedCard: React.FC<{
     const dismissScale = useRef(new Animated.Value(1)).current;
     const dismissSlide = useRef(new Animated.Value(0)).current;
 
-    // Entrance
+    // Entrance — tightened: 50ms stagger (was 120) and 280ms duration (was 450)
+    // so all cards land in ~430ms total instead of ~810ms. Logo pop runs
+    // concurrently with the card landing instead of waiting for it to finish.
     useEffect(() => {
-        const delay = index * 120;
+        const delay = index * 50;
         setTimeout(() => {
             Animated.parallel([
-                Animated.timing(cardFade, { toValue: 1, duration: 450, easing: Easing.out(Easing.cubic), useNativeDriver: true }),
-                Animated.spring(cardSlide, { toValue: 0, tension: 50, friction: 8, useNativeDriver: true }),
-                Animated.spring(cardScale, { toValue: 1, tension: 60, friction: 7, useNativeDriver: true }),
-            ]).start(() => {
-                Animated.sequence([
-                    Animated.delay(80),
-                    Animated.spring(logoScale, { toValue: 1, tension: 120, friction: 6, useNativeDriver: true }),
-                ]).start();
-            });
+                Animated.timing(cardFade, { toValue: 1, duration: 280, easing: Easing.out(Easing.cubic), useNativeDriver: true }),
+                Animated.spring(cardSlide, { toValue: 0, tension: 70, friction: 8, useNativeDriver: true }),
+                Animated.spring(cardScale, { toValue: 1, tension: 80, friction: 7, useNativeDriver: true }),
+                Animated.spring(logoScale, { toValue: 1, tension: 120, friction: 6, useNativeDriver: true }),
+            ]).start();
         }, delay);
     }, []);
 
@@ -305,10 +303,12 @@ const RestaurantSuggestions: React.FC<RestaurantSuggestionsProps> = ({ restauran
 
     const handleCardSelect = (name: string) => {
         setSelectedName(name);
-        // Wait for the selection animation to play, then call parent onSelect
-        setTimeout(() => {
-            onSelect(name);
-        }, 900);
+        // Fire onSelect immediately so menu injection / next-screen work starts
+        // on the same frame as the tap. The selection celebration (glow + check
+        // pop + ring) keeps animating in parallel — the parent's UI transition
+        // doesn't unmount these cards instantly, so the user still sees the
+        // satisfying confirmation, just without an artificial 900ms gate.
+        onSelect(name);
     };
 
     if (restaurants.length === 0) return null;

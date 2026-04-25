@@ -1302,8 +1302,8 @@ ${combosCatalogForPrompt()}
                     ? getComboInstructions(activeCombo)
                     : getInitialInstructions();
                 const greeting = activeCombo
-                    ? `رحّب بالمستخدم كلمتين فقط ("هلا!" أو "أبشر!") ثم اسأله على طول عن ${activeCombo.groups.find((g) => g.required)?.title_ar || 'الحجم'}. جملة واحدة قصيرة.`
-                    : `رحّب بالمستخدم ترحيب حار وقصير وعرّف عن نفسك إنك "جاهز AI" واسأله وش يشتهي اليوم — برقر، دجاج، شاورما، بيتزا، أو قهوة؟ جملتين فقط لا تطوّل. لا تذكر أسماء مطاعم.`;
+                    ? `ابدأ ردك بالضبط بعبارة "هلا يا قلبي" ثم اسأله على طول عن ${activeCombo.groups.find((g) => g.required)?.title_ar || 'الحجم'}. جملة واحدة قصيرة.`
+                    : `ابدأ ردك بالضبط بعبارة "هلا يا قلبي" ثم عرّف عن نفسك إنك "جاهز AI" واسأله وش يشتهي اليوم — برقر، دجاج، شاورما، بيتزا، أو قهوة؟ جملتين فقط لا تطوّل. لا تذكر أسماء مطاعم.`;
 
                 // Initialize Session
                 const sessionUpdate = {
@@ -1704,8 +1704,8 @@ ${combosCatalogForPrompt()}
                     ? getComboInstructions(activeCombo)
                     : getInitialInstructions();
                 const greeting = activeCombo
-                    ? `رحّب بالمستخدم كلمتين فقط ("هلا!" أو "أبشر!") ثم اسأله على طول عن ${activeCombo.groups.find((g) => g.required)?.title_ar || 'الحجم'}. جملة واحدة قصيرة.`
-                    : `رحّب بالمستخدم ترحيب حار وقصير وعرّف عن نفسك إنك "جاهز AI" واسأله وش يشتهي اليوم — برقر، دجاج، شاورما، بيتزا، أو قهوة؟ جملتين فقط لا تطوّل. لا تذكر أسماء مطاعم.`;
+                    ? `ابدأ ردك بالضبط بعبارة "هلا يا قلبي" ثم اسأله على طول عن ${activeCombo.groups.find((g) => g.required)?.title_ar || 'الحجم'}. جملة واحدة قصيرة.`
+                    : `ابدأ ردك بالضبط بعبارة "هلا يا قلبي" ثم عرّف عن نفسك إنك "جاهز AI" واسأله وش يشتهي اليوم — برقر، دجاج، شاورما، بيتزا، أو قهوة؟ جملتين فقط لا تطوّل. لا تذكر أسماء مطاعم.`;
 
                 // Setup message — locks audio modality, enables transcription both ways,
                 // tunes VAD to match OpenAI's server_vad thresholds for consistent barge-in feel.
@@ -2650,6 +2650,18 @@ ${combosCatalogForPrompt()}
             }
             // The WAV may have been written before the failure — delete unconditionally.
             FileSystem.deleteAsync(uri, { idempotent: true }).catch(() => {});
+            // Restore the consumed batch back to the pending queue, otherwise
+            // the 120ms retry sees an empty queue and exits — that's the bug
+            // where the FIRST greeting's transcript shows but no audio plays.
+            // Order matters: batch was the head of the queue, so unshift it
+            // back in front of any chunks that arrived during the failed try.
+            // Skip if interrupted in the meantime — those chunks should drop.
+            if (!aiResponseInterruptedRef.current) {
+                streamingPendingRef.current = batch.concat(streamingPendingRef.current);
+                let restoredBytes = 0;
+                for (let i = 0; i < batch.length; i++) restoredBytes += batch[i].length;
+                streamingPendingBytesRef.current += restoredBytes;
+            }
             streamingBusyRef.current = false;
             // Defer the drain retry. A synchronous retry after AudioFocus
             // failure just fails the same way and risks stacking playbacks
