@@ -9,113 +9,79 @@ import Animated, {
     cancelAnimation,
     Easing,
     runOnJS,
-    SharedValue,
-    useFrameCallback,
 } from 'react-native-reanimated';
 
 interface Props {
     state: 'listen' | 'respond';
-    // Live amplitude (0..1) driven by the AI's speech, written from the audio
-    // status callback in VoiceOverlay. Reading it inside a worklet (UI thread)
-    // is what keeps the equalizer smoothly tracking speech without bridge hops.
-    // If omitted, bars fall back to the procedural idle wave.
-    amplitudeShared?: SharedValue<number>;
 }
 
 export interface AIVisualizerHandle {
     forceListen: () => void;
 }
 
-// --- Dimensions (unchanged from the original) ---
+// Reference Figma values (Frame 3: bar width 61, gap 3, x targets [-96,-32,32,96]).
+// SCALE keeps the orb sized for the mobile screen — adjust a single constant
+// if the orb needs to be bigger/smaller; everything scales together.
 const SCALE = 0.7;
-const BAR_WIDTH = Math.round(61 * SCALE);                                   // 43
-const BAR_BASE_HEIGHTS = [95, 138, 138, 95].map(h => Math.round(h * SCALE)); // [67, 97, 97, 67]
-const X_TARGETS = [-96, -32, 32, 96].map(x => Math.round(x * SCALE));        // [-67, -22, 22, 67]
-const CIRCLE_SIZE = Math.round(140 * SCALE);                                 // 98
-const PILL_W = Math.round(170 * SCALE);                                      // 119
-const PILL_H = Math.round(80 * SCALE);                                       // 56
-const PILL_R = Math.round(40 * SCALE);                                       // 28
-const TALL_BAR_H = Math.round(138 * SCALE);                                  // 97
-const CONTAINER_W = Math.round(300 * SCALE);                                 // 210
-const CONTAINER_H = Math.round(160 * SCALE);                                 // 112
+const BAR_WIDTH = Math.round(61 * SCALE);
+const BAR_BASE_HEIGHTS = [95, 138, 138, 95].map(h => Math.round(h * SCALE));
+const X_TARGETS = [-96, -32, 32, 96].map(x => Math.round(x * SCALE));
+const CIRCLE_SIZE = Math.round(140 * SCALE);
+const PILL_W = Math.round(170 * SCALE);
+const PILL_H = Math.round(80 * SCALE);
+const PILL_R = Math.round(40 * SCALE);
+const TALL_BAR_H = Math.round(138 * SCALE);
+const CONTAINER_W = Math.round(300 * SCALE);
+const CONTAINER_H = Math.round(160 * SCALE);
 
-// --- Easings (unchanged GSAP approximations) ---
-const easeExpoInOut = Easing.bezier(0.87, 0, 0.13, 1);
-const easeExpoIn = Easing.bezier(0.95, 0.05, 0.795, 0.035);
-const easeBackOut15 = Easing.bezier(0.34, 1.5, 0.64, 1);
-const easeBackOut18 = Easing.bezier(0.34, 1.8, 0.64, 1);
-const easeOutQuad = Easing.out(Easing.quad);
+// GSAP-equivalent easings
+const expoIn = Easing.bezier(0.95, 0.05, 0.795, 0.035);
+const expoInOut = Easing.bezier(0.87, 0, 0.13, 1);
+const backOut15 = Easing.bezier(0.34, 1.5, 0.64, 1);
+const backOut18 = Easing.bezier(0.34, 1.8, 0.64, 1);
+const power2Out = Easing.out(Easing.quad);
+const power4Out = Easing.bezier(0.165, 0.84, 0.44, 1);
+const sineInOut = Easing.bezier(0.45, 0.05, 0.55, 0.95);
 
-// --- Smoothing constants for the equalizer / jitter ---
-const BAR_SMOOTHING = 0.15;
-const JITTER_SMOOTHING = 0.12;
+const AIVisualizer = forwardRef<AIVisualizerHandle, Props>(({ state }, ref) => {
+    // Circle / blob shared values
+    const cOpacity = useSharedValue(1);
+    const cW = useSharedValue(CIRCLE_SIZE);
+    const cH = useSharedValue(CIRCLE_SIZE);
+    const cR = useSharedValue(CIRCLE_SIZE / 2);
+    const cScale = useSharedValue(1);
 
-// Why this component runs on Reanimated rather than RN's Animated:
-// every shape and bar update happens on the UI thread via worklets, so the
-// animation doesn't compete with WebSocket parsing, base64 string concat,
-// FileSystem.writeAsStringAsync, or Audio.Sound.createAsync — all of which
-// burst on the JS thread the instant the AI starts speaking. The same exact
-// visual (real width/height/borderRadius, no scaleY distortion of the pill
-// ends) now stays a guaranteed 60 FPS through the listen↔respond handoff
-// and through equalizer ticks during AI speech.
-const AIVisualizer = forwardRef<AIVisualizerHandle, Props>(({ state, amplitudeShared }, ref) => {
-    // --- Circle / blob shared values ---
-    const circleW = useSharedValue(CIRCLE_SIZE);
-    const circleH = useSharedValue(CIRCLE_SIZE);
-    const circleR = useSharedValue(CIRCLE_SIZE / 2);
-    const circleOpacity = useSharedValue(1);
-    const circleScale = useSharedValue(1);
-
-    // --- Ripples ---
+    // Sonar ripples
     const r0Scale = useSharedValue(1);
     const r0Opacity = useSharedValue(0);
     const r1Scale = useSharedValue(1);
     const r1Opacity = useSharedValue(0);
 
-    // --- Bars: height (layout), translateX (transform), opacity ---
-    const b0H = useSharedValue(0);
-    const b1H = useSharedValue(0);
-    const b2H = useSharedValue(0);
-    const b3H = useSharedValue(0);
-    const b0X = useSharedValue(0);
-    const b1X = useSharedValue(0);
-    const b2X = useSharedValue(0);
-    const b3X = useSharedValue(0);
-    const b0O = useSharedValue(0);
-    const b1O = useSharedValue(0);
-    const b2O = useSharedValue(0);
-    const b3O = useSharedValue(0);
+    // Four bars
+    const b0X = useSharedValue(0); const b0H = useSharedValue(0); const b0O = useSharedValue(0);
+    const b1X = useSharedValue(0); const b1H = useSharedValue(0); const b1O = useSharedValue(0);
+    const b2X = useSharedValue(0); const b2H = useSharedValue(0); const b2O = useSharedValue(0);
+    const b3X = useSharedValue(0); const b3H = useSharedValue(0); const b3O = useSharedValue(0);
+    const bX = [b0X, b1X, b2X, b3X];
+    const bH = [b0H, b1H, b2H, b3H];
+    const bO = [b0O, b1O, b2O, b3O];
 
-    // --- Equalizer + jitter run-flags (worklet-readable) ---
-    const eqActive = useSharedValue(false);
-    const jitterActive = useSharedValue(false);
-
-    // Per-bar smoothing scratch (lives on UI thread via shared values).
-    const eqH0 = useSharedValue(0);
-    const eqH1 = useSharedValue(0);
-    const eqH2 = useSharedValue(0);
-    const eqH3 = useSharedValue(0);
-    const eqS0 = useSharedValue(0);
-    const eqS1 = useSharedValue(0);
-    const eqS2 = useSharedValue(0);
-    const eqS3 = useSharedValue(0);
-
-    const jitterTarget = useSharedValue(1);
-    const jitterNextPick = useSharedValue(0);
-
-    // JS-side liveness flag for the staggered second-ripple setTimeout.
+    // JS-side liveness flags + timer refs for the procedural eq / ripples / jitter
+    const eqActiveRef = useRef(false);
+    const eqTimersRef = useRef<Array<ReturnType<typeof setTimeout> | null>>([null, null, null, null]);
     const ripplesActiveRef = useRef(false);
     const r1TimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const jitterActiveRef = useRef(false);
+    const jitterTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-    // --- useAnimatedStyle: each bound to its own shared values, all read on UI thread ---
+    // Animated styles
     const circleStyle = useAnimatedStyle(() => ({
-        width: circleW.value,
-        height: circleH.value,
-        borderRadius: circleR.value,
-        opacity: circleOpacity.value,
-        transform: [{ scale: circleScale.value }],
+        width: cW.value,
+        height: cH.value,
+        borderRadius: cR.value,
+        opacity: cOpacity.value,
+        transform: [{ scale: cScale.value }],
     }));
-
     const r0Style = useAnimatedStyle(() => ({
         opacity: r0Opacity.value,
         transform: [{ scale: r0Scale.value }],
@@ -124,334 +90,193 @@ const AIVisualizer = forwardRef<AIVisualizerHandle, Props>(({ state, amplitudeSh
         opacity: r1Opacity.value,
         transform: [{ scale: r1Scale.value }],
     }));
-
     const bar0Style = useAnimatedStyle(() => ({
-        width: BAR_WIDTH,
-        height: b0H.value,
-        borderRadius: BAR_WIDTH / 2,
-        opacity: b0O.value,
-        transform: [{ translateX: b0X.value }],
+        width: BAR_WIDTH, height: b0H.value, borderRadius: BAR_WIDTH / 2,
+        opacity: b0O.value, transform: [{ translateX: b0X.value }],
     }));
     const bar1Style = useAnimatedStyle(() => ({
-        width: BAR_WIDTH,
-        height: b1H.value,
-        borderRadius: BAR_WIDTH / 2,
-        opacity: b1O.value,
-        transform: [{ translateX: b1X.value }],
+        width: BAR_WIDTH, height: b1H.value, borderRadius: BAR_WIDTH / 2,
+        opacity: b1O.value, transform: [{ translateX: b1X.value }],
     }));
     const bar2Style = useAnimatedStyle(() => ({
-        width: BAR_WIDTH,
-        height: b2H.value,
-        borderRadius: BAR_WIDTH / 2,
-        opacity: b2O.value,
-        transform: [{ translateX: b2X.value }],
+        width: BAR_WIDTH, height: b2H.value, borderRadius: BAR_WIDTH / 2,
+        opacity: b2O.value, transform: [{ translateX: b2X.value }],
     }));
     const bar3Style = useAnimatedStyle(() => ({
-        width: BAR_WIDTH,
-        height: b3H.value,
-        borderRadius: BAR_WIDTH / 2,
-        opacity: b3O.value,
-        transform: [{ translateX: b3X.value }],
+        width: BAR_WIDTH, height: b3H.value, borderRadius: BAR_WIDTH / 2,
+        opacity: b3O.value, transform: [{ translateX: b3X.value }],
     }));
 
-    // --- Single UI-thread frame callback for equalizer + jitter ---
-    // useFrameCallback fires on every screen vsync (60+ Hz on UI thread).
-    // We branch internally on eqActive / jitterActive so the same callback
-    // serves both states without re-mounting.
-    useFrameCallback((info) => {
-        'worklet';
-        const t = info.timeSinceFirstFrame / 1000;
-        const tMs = info.timeSinceFirstFrame;
+    // ── Procedural equalizer ──
+    // Each bar independently animates to a random height with a random duration,
+    // then schedules its next leg from the JS side. This mirrors the reference
+    // GSAP `animateBar` pattern: a self-restarting random walk.
+    const animateBar = (i: number) => {
+        if (!eqActiveRef.current) return;
+        const maxH = BAR_BASE_HEIGHTS[i];
+        const minH = maxH * 0.25;
+        const targetH = minH + Math.random() * (maxH * 1.1 - minH);
+        const durationMs = 120 + Math.random() * 180;
+        bH[i].value = withTiming(targetH, { duration: durationMs, easing: sineInOut });
+        eqTimersRef.current[i] = setTimeout(() => animateBar(i), durationMs);
+    };
 
-        if (eqActive.value) {
-            const amp = amplitudeShared
-                ? Math.max(0, Math.min(1, amplitudeShared.value))
-                : 0;
+    const startEqualizer = () => {
+        eqActiveRef.current = true;
+        for (let i = 0; i < 4; i++) animateBar(i);
+    };
 
-            // Bar 0
-            {
-                const maxH = BAR_BASE_HEIGHTS[0];
-                const minH = maxH * 0.18;
-                const wave =
-                    0.26 * Math.sin(t * 2.1 + 0 * 1.3) +
-                    0.18 * Math.sin(t * 3.7 + 0 * 0.8) +
-                    0.10 * Math.sin(t * 5.2 + 0 * 2.1);
-                if (Math.random() < 0.02) eqS0.value = 0.20 + Math.random() * 0.30;
-                else eqS0.value *= 0.94;
-                const idle = Math.max(0.22, Math.min(0.90, 0.45 + wave + eqS0.value));
-                // When real amplitude is available (AI speaking), bars track it
-                // directly so the user can see the moment audio actually goes
-                // silent. The procedural `idle` is only the fallback when there's
-                // no amplitude source — otherwise it masked end-of-speech.
-                const eff = amplitudeShared ? amp : idle;
-                const target = minH + eff * (maxH - minH);
-                eqH0.value += (target - eqH0.value) * BAR_SMOOTHING;
-                b0H.value = eqH0.value;
-            }
-            // Bar 1
-            {
-                const maxH = BAR_BASE_HEIGHTS[1];
-                const minH = maxH * 0.18;
-                const wave =
-                    0.26 * Math.sin(t * 2.1 + 1 * 1.3) +
-                    0.18 * Math.sin(t * 3.7 + 1 * 0.8) +
-                    0.10 * Math.sin(t * 5.2 + 1 * 2.1);
-                if (Math.random() < 0.02) eqS1.value = 0.20 + Math.random() * 0.30;
-                else eqS1.value *= 0.94;
-                const idle = Math.max(0.22, Math.min(0.90, 0.45 + wave + eqS1.value));
-                const eff = amplitudeShared ? amp : idle;
-                const target = minH + eff * (maxH - minH);
-                eqH1.value += (target - eqH1.value) * BAR_SMOOTHING;
-                b1H.value = eqH1.value;
-            }
-            // Bar 2
-            {
-                const maxH = BAR_BASE_HEIGHTS[2];
-                const minH = maxH * 0.18;
-                const wave =
-                    0.26 * Math.sin(t * 2.1 + 2 * 1.3) +
-                    0.18 * Math.sin(t * 3.7 + 2 * 0.8) +
-                    0.10 * Math.sin(t * 5.2 + 2 * 2.1);
-                if (Math.random() < 0.02) eqS2.value = 0.20 + Math.random() * 0.30;
-                else eqS2.value *= 0.94;
-                const idle = Math.max(0.22, Math.min(0.90, 0.45 + wave + eqS2.value));
-                const eff = amplitudeShared ? amp : idle;
-                const target = minH + eff * (maxH - minH);
-                eqH2.value += (target - eqH2.value) * BAR_SMOOTHING;
-                b2H.value = eqH2.value;
-            }
-            // Bar 3
-            {
-                const maxH = BAR_BASE_HEIGHTS[3];
-                const minH = maxH * 0.18;
-                const wave =
-                    0.26 * Math.sin(t * 2.1 + 3 * 1.3) +
-                    0.18 * Math.sin(t * 3.7 + 3 * 0.8) +
-                    0.10 * Math.sin(t * 5.2 + 3 * 2.1);
-                if (Math.random() < 0.02) eqS3.value = 0.20 + Math.random() * 0.30;
-                else eqS3.value *= 0.94;
-                const idle = Math.max(0.22, Math.min(0.90, 0.45 + wave + eqS3.value));
-                const eff = amplitudeShared ? amp : idle;
-                const target = minH + eff * (maxH - minH);
-                eqH3.value += (target - eqH3.value) * BAR_SMOOTHING;
-                b3H.value = eqH3.value;
+    const stopEqualizer = () => {
+        eqActiveRef.current = false;
+        for (let i = 0; i < 4; i++) {
+            const t = eqTimersRef.current[i];
+            if (t) {
+                clearTimeout(t);
+                eqTimersRef.current[i] = null;
             }
         }
+    };
 
-        if (jitterActive.value) {
-            if (tMs >= jitterNextPick.value) {
-                jitterTarget.value = 1 + Math.random() * 0.12;
-                jitterNextPick.value = tMs + 100 + Math.random() * 100;
-            }
-            circleScale.value += (jitterTarget.value - circleScale.value) * JITTER_SMOOTHING;
-        }
-    });
-
+    // ── Listening feedback (sonar ripples + circle jitter) ──
     const startListeningFeedback = () => {
         ripplesActiveRef.current = true;
 
-        // First ripple — immediate, infinite repeat.
-        cancelAnimation(r0Scale);
-        cancelAnimation(r0Opacity);
-        r0Scale.value = 1;
-        r0Opacity.value = 0.2;
-        r0Scale.value = withRepeat(
-            withTiming(2.2, { duration: 2000, easing: easeOutQuad }),
-            -1,
-            false,
-        );
-        r0Opacity.value = withRepeat(
-            withTiming(0, { duration: 2000, easing: easeOutQuad }),
-            -1,
-            false,
-        );
+        cancelAnimation(r0Scale); cancelAnimation(r0Opacity);
+        r0Scale.value = 1; r0Opacity.value = 0.2;
+        r0Scale.value = withRepeat(withTiming(2.2, { duration: 2000, easing: power2Out }), -1, false);
+        r0Opacity.value = withRepeat(withTiming(0, { duration: 2000, easing: power2Out }), -1, false);
 
-        // Second ripple — staggered by 1s. Use a JS timer so we can cancel cleanly
-        // when the state flips back to 'respond' before the stagger fires.
         if (r1TimerRef.current) clearTimeout(r1TimerRef.current);
         r1TimerRef.current = setTimeout(() => {
             r1TimerRef.current = null;
             if (!ripplesActiveRef.current) return;
-            cancelAnimation(r1Scale);
-            cancelAnimation(r1Opacity);
-            r1Scale.value = 1;
-            r1Opacity.value = 0.2;
-            r1Scale.value = withRepeat(
-                withTiming(2.2, { duration: 2000, easing: easeOutQuad }),
-                -1,
-                false,
-            );
-            r1Opacity.value = withRepeat(
-                withTiming(0, { duration: 2000, easing: easeOutQuad }),
-                -1,
-                false,
-            );
+            cancelAnimation(r1Scale); cancelAnimation(r1Opacity);
+            r1Scale.value = 1; r1Opacity.value = 0.2;
+            r1Scale.value = withRepeat(withTiming(2.2, { duration: 2000, easing: power2Out }), -1, false);
+            r1Opacity.value = withRepeat(withTiming(0, { duration: 2000, easing: power2Out }), -1, false);
         }, 1000);
 
-        // Jitter on the listening-orb scale.
-        jitterActive.value = true;
-        jitterTarget.value = 1;
-        jitterNextPick.value = 0;
+        jitterActiveRef.current = true;
+        const tickJitter = () => {
+            if (!jitterActiveRef.current) return;
+            const target = 1 + Math.random() * 0.12;
+            const dur = 100 + Math.random() * 100;
+            cScale.value = withTiming(target, { duration: dur, easing: sineInOut });
+            jitterTimerRef.current = setTimeout(tickJitter, dur);
+        };
+        tickJitter();
     };
 
     const stopListeningFeedback = () => {
         ripplesActiveRef.current = false;
-        if (r1TimerRef.current) {
-            clearTimeout(r1TimerRef.current);
-            r1TimerRef.current = null;
-        }
-        jitterActive.value = false;
-        cancelAnimation(r0Scale);
-        cancelAnimation(r0Opacity);
-        cancelAnimation(r1Scale);
-        cancelAnimation(r1Opacity);
-        // Quick fade-out so the ripples don't pop off mid-cycle.
+        jitterActiveRef.current = false;
+        if (r1TimerRef.current) { clearTimeout(r1TimerRef.current); r1TimerRef.current = null; }
+        if (jitterTimerRef.current) { clearTimeout(jitterTimerRef.current); jitterTimerRef.current = null; }
+        cancelAnimation(r0Scale); cancelAnimation(r0Opacity);
+        cancelAnimation(r1Scale); cancelAnimation(r1Opacity);
         r0Opacity.value = withTiming(0, { duration: 200 });
         r1Opacity.value = withTiming(0, { duration: 200 });
     };
 
-    const startEqualizer = () => {
-        // Seed UI-thread scratch from current bar heights so the first frame
-        // doesn't snap. Done from JS — sharedValue assignments are sync.
-        eqH0.value = b0H.value;
-        eqH1.value = b1H.value;
-        eqH2.value = b2H.value;
-        eqH3.value = b3H.value;
-        eqS0.value = 0;
-        eqS1.value = 0;
-        eqS2.value = 0;
-        eqS3.value = 0;
-        eqActive.value = true;
-    };
-
-    const stopEqualizer = () => {
-        eqActive.value = false;
-    };
-
-    // Imperative API — instantly snap to the listening orb.
+    // ── Imperative API: snap to listening orb ──
     useImperativeHandle(ref, () => ({
         forceListen: () => {
             stopEqualizer();
             stopListeningFeedback();
-
-            cancelAnimation(circleW);
-            cancelAnimation(circleH);
-            cancelAnimation(circleR);
-            cancelAnimation(circleOpacity);
-            cancelAnimation(circleScale);
-            cancelAnimation(b0H); cancelAnimation(b1H); cancelAnimation(b2H); cancelAnimation(b3H);
-            cancelAnimation(b0X); cancelAnimation(b1X); cancelAnimation(b2X); cancelAnimation(b3X);
-            cancelAnimation(b0O); cancelAnimation(b1O); cancelAnimation(b2O); cancelAnimation(b3O);
-
-            b0O.value = 0; b1O.value = 0; b2O.value = 0; b3O.value = 0;
-            b0X.value = 0; b1X.value = 0; b2X.value = 0; b3X.value = 0;
-            b0H.value = 0; b1H.value = 0; b2H.value = 0; b3H.value = 0;
-            circleOpacity.value = 1;
-            circleW.value = CIRCLE_SIZE;
-            circleH.value = CIRCLE_SIZE;
-            circleR.value = CIRCLE_SIZE / 2;
-            circleScale.value = 1;
-
+            cancelAnimation(cW); cancelAnimation(cH); cancelAnimation(cR);
+            cancelAnimation(cOpacity); cancelAnimation(cScale);
+            for (let i = 0; i < 4; i++) {
+                cancelAnimation(bX[i]); cancelAnimation(bH[i]); cancelAnimation(bO[i]);
+                bX[i].value = 0; bH[i].value = 0; bO[i].value = 0;
+            }
+            cOpacity.value = 1;
+            cW.value = CIRCLE_SIZE; cH.value = CIRCLE_SIZE; cR.value = CIRCLE_SIZE / 2;
+            cScale.value = 1;
             startListeningFeedback();
         },
     }));
 
-    // --- State transitions (chained via withTiming callbacks on the UI thread) ---
+    // ── State transitions (timings match the GSAP reference exactly) ──
     useEffect(() => {
         if (state === 'listen') {
             stopEqualizer();
-
             const barsVisible = b0O.value > 0;
 
             if (barsVisible) {
-                // Bars collapse back to a single tall bar in the center.
-                const collapseEasing = easeExpoInOut;
-                cancelAnimation(b0X); cancelAnimation(b1X); cancelAnimation(b2X); cancelAnimation(b3X);
-                cancelAnimation(b0H); cancelAnimation(b1H); cancelAnimation(b2H); cancelAnimation(b3H);
-
-                // Snappy collapse — was 350ms, now 180ms — so the orb visibly
-                // reacts to "AI stopped" almost instantly. Full respond→listen
-                // transition is now ~430ms (collapse 180 + expand 250) vs 850ms.
-                b0X.value = withTiming(0, { duration: 180, easing: collapseEasing });
-                b1X.value = withTiming(0, { duration: 180, easing: collapseEasing });
-                b2X.value = withTiming(0, { duration: 180, easing: collapseEasing });
-                b3X.value = withTiming(0, { duration: 180, easing: collapseEasing });
-                b0H.value = withTiming(TALL_BAR_H, { duration: 180, easing: collapseEasing });
-                b1H.value = withTiming(TALL_BAR_H, { duration: 180, easing: collapseEasing });
-                b2H.value = withTiming(TALL_BAR_H, { duration: 180, easing: collapseEasing });
-                b3H.value = withTiming(TALL_BAR_H, { duration: 180, easing: collapseEasing }, (finished) => {
-                    'worklet';
-                    if (!finished) return;
-
-                    // Hand off: bars hide, circle re-appears at single-bar shape, then expands.
-                    b0O.value = 0; b1O.value = 0; b2O.value = 0; b3O.value = 0;
-                    circleOpacity.value = 1;
-                    circleW.value = BAR_WIDTH;
-                    circleH.value = TALL_BAR_H;
-                    circleR.value = BAR_WIDTH / 2;
-                    circleScale.value = 1;
-
-                    circleW.value = withTiming(CIRCLE_SIZE, { duration: 250, easing: easeBackOut15 });
-                    circleH.value = withTiming(CIRCLE_SIZE, { duration: 250, easing: easeBackOut15 });
-                    circleR.value = withTiming(CIRCLE_SIZE / 2, { duration: 250, easing: easeBackOut15 }, (f) => {
+                // Phase 1 — bars converge to center at uniform height (350ms).
+                // GSAP "stagger from edges" approximation: outer bars (0,3) start
+                // immediately, inner bars (1,2) start 40ms later (total spread 80ms).
+                const collapseDur = 350;
+                const innerDelay = 40;
+                for (let i = 0; i < 4; i++) {
+                    cancelAnimation(bX[i]); cancelAnimation(bH[i]);
+                    const d = (i === 1 || i === 2) ? innerDelay : 0;
+                    bX[i].value = withDelay(d, withTiming(0, { duration: collapseDur, easing: expoInOut }));
+                    bH[i].value = withDelay(d, withTiming(TALL_BAR_H, { duration: collapseDur, easing: expoInOut }, (finished) => {
                         'worklet';
-                        if (f) runOnJS(startListeningFeedback)();
-                    });
-                });
+                        if (!finished || i !== 3) return;
+                        // After last bar finishes, hand off to circle expansion
+                        for (let j = 0; j < 4; j++) bO[j].value = 0;
+                        cOpacity.value = 1;
+                        cW.value = BAR_WIDTH;
+                        cH.value = TALL_BAR_H;
+                        cR.value = BAR_WIDTH / 2;
+                        cScale.value = 1;
+                        // Phase 2 — circle expands (500ms back.out(1.5))
+                        cW.value = withTiming(CIRCLE_SIZE, { duration: 500, easing: backOut15 });
+                        cH.value = withTiming(CIRCLE_SIZE, { duration: 500, easing: backOut15 });
+                        cR.value = withTiming(CIRCLE_SIZE / 2, { duration: 500, easing: backOut15 }, (f) => {
+                            'worklet';
+                            if (f) runOnJS(startListeningFeedback)();
+                        });
+                    }));
+                }
             } else {
-                circleOpacity.value = 1;
-                circleW.value = CIRCLE_SIZE;
-                circleH.value = CIRCLE_SIZE;
-                circleR.value = CIRCLE_SIZE / 2;
-                circleScale.value = 1;
-                startListeningFeedback();
+                // Initial entry — fade circle in directly (400ms power4.out)
+                cOpacity.value = 1; cScale.value = 1;
+                cW.value = withTiming(CIRCLE_SIZE, { duration: 400, easing: power4Out });
+                cH.value = withTiming(CIRCLE_SIZE, { duration: 400, easing: power4Out });
+                cR.value = withTiming(CIRCLE_SIZE / 2, { duration: 400, easing: power4Out }, (f) => {
+                    'worklet';
+                    if (f) runOnJS(startListeningFeedback)();
+                });
             }
         } else if (state === 'respond') {
             stopListeningFeedback();
+            cancelAnimation(cW); cancelAnimation(cH); cancelAnimation(cR);
+            cancelAnimation(cScale); cancelAnimation(cOpacity);
 
-            // Phase 1: squish to pill (180 ms).
-            cancelAnimation(circleW); cancelAnimation(circleH); cancelAnimation(circleR);
-            cancelAnimation(circleScale); cancelAnimation(circleOpacity);
-
-            circleW.value = withTiming(PILL_W, { duration: 180, easing: easeExpoInOut });
-            circleH.value = withTiming(PILL_H, { duration: 180, easing: easeExpoInOut });
-            circleScale.value = withTiming(1, { duration: 180, easing: easeExpoInOut });
-            circleR.value = withTiming(PILL_R, { duration: 180, easing: easeExpoInOut }, (p1Done) => {
+            // Phase 1 — circle squishes to pill (180ms expo.inOut)
+            cW.value = withTiming(PILL_W, { duration: 180, easing: expoInOut });
+            cH.value = withTiming(PILL_H, { duration: 180, easing: expoInOut });
+            cScale.value = withTiming(1, { duration: 180, easing: expoInOut });
+            cR.value = withTiming(PILL_R, { duration: 180, easing: expoInOut }, (p1) => {
                 'worklet';
-                if (!p1Done) return;
-
-                // Phase 2: crunch pill into one tall bar (150 ms).
-                circleW.value = withTiming(BAR_WIDTH, { duration: 150, easing: easeExpoIn });
-                circleH.value = withTiming(TALL_BAR_H, { duration: 150, easing: easeExpoIn });
-                circleR.value = withTiming(BAR_WIDTH / 2, { duration: 150, easing: easeExpoIn }, (p2Done) => {
+                if (!p1) return;
+                // Phase 2 — pill crunches into single tall bar (150ms expo.in)
+                cW.value = withTiming(BAR_WIDTH, { duration: 150, easing: expoIn });
+                cH.value = withTiming(TALL_BAR_H, { duration: 150, easing: expoIn });
+                cR.value = withTiming(BAR_WIDTH / 2, { duration: 150, easing: expoIn }, (p2) => {
                     'worklet';
-                    if (!p2Done) return;
-
-                    // Hand-off: hide circle, reveal four bars stacked on the center
-                    // at TALL_BAR_H so the layout is settled before the fan-out
-                    // animation begins. Setting opacity and height in the same
-                    // worklet tick keeps the orb from disappearing for a frame.
-                    circleOpacity.value = 0;
+                    if (!p2) return;
+                    // Hand-off: hide circle, reveal stacked bars at center
+                    cOpacity.value = 0;
                     b0O.value = 1; b0X.value = 0; b0H.value = TALL_BAR_H;
                     b1O.value = 1; b1X.value = 0; b1H.value = TALL_BAR_H;
                     b2O.value = 1; b2X.value = 0; b2H.value = TALL_BAR_H;
                     b3O.value = 1; b3X.value = 0; b3H.value = TALL_BAR_H;
-
-                    // Phase 3: fan out (450 ms, 30 ms stagger per bar).
-                    b0X.value = withTiming(X_TARGETS[0], { duration: 450, easing: easeBackOut18 });
-                    b0H.value = withTiming(BAR_BASE_HEIGHTS[0], { duration: 450, easing: easeBackOut18 });
-                    b1X.value = withDelay(30, withTiming(X_TARGETS[1], { duration: 450, easing: easeBackOut18 }));
-                    b1H.value = withDelay(30, withTiming(BAR_BASE_HEIGHTS[1], { duration: 450, easing: easeBackOut18 }));
-                    b2X.value = withDelay(60, withTiming(X_TARGETS[2], { duration: 450, easing: easeBackOut18 }));
-                    b2H.value = withDelay(60, withTiming(BAR_BASE_HEIGHTS[2], { duration: 450, easing: easeBackOut18 }));
-                    b3X.value = withDelay(90, withTiming(X_TARGETS[3], { duration: 450, easing: easeBackOut18 }));
-                    b3H.value = withDelay(
-                        90,
-                        withTiming(BAR_BASE_HEIGHTS[3], { duration: 450, easing: easeBackOut18 }, (p3Done) => {
-                            'worklet';
-                            if (p3Done) runOnJS(startEqualizer)();
-                        }),
-                    );
+                    // Phase 3 — fan out to figma positions/heights (450ms back.out(1.8), 30ms stagger)
+                    b0X.value = withTiming(X_TARGETS[0], { duration: 450, easing: backOut18 });
+                    b0H.value = withTiming(BAR_BASE_HEIGHTS[0], { duration: 450, easing: backOut18 });
+                    b1X.value = withDelay(30, withTiming(X_TARGETS[1], { duration: 450, easing: backOut18 }));
+                    b1H.value = withDelay(30, withTiming(BAR_BASE_HEIGHTS[1], { duration: 450, easing: backOut18 }));
+                    b2X.value = withDelay(60, withTiming(X_TARGETS[2], { duration: 450, easing: backOut18 }));
+                    b2H.value = withDelay(60, withTiming(BAR_BASE_HEIGHTS[2], { duration: 450, easing: backOut18 }));
+                    b3X.value = withDelay(90, withTiming(X_TARGETS[3], { duration: 450, easing: backOut18 }));
+                    b3H.value = withDelay(90, withTiming(BAR_BASE_HEIGHTS[3], { duration: 450, easing: backOut18 }, (p3) => {
+                        'worklet';
+                        if (p3) runOnJS(startEqualizer)();
+                    }));
                 });
             });
         }
@@ -460,16 +285,9 @@ const AIVisualizer = forwardRef<AIVisualizerHandle, Props>(({ state, amplitudeSh
 
     return (
         <View style={styles.container} pointerEvents="none">
-            {/* Sonar ripples */}
             <Animated.View style={[styles.ripple, r0Style]} />
             <Animated.View style={[styles.ripple, r1Style]} />
-
-            {/* Circle / blob — width/height/borderRadius animated as real layout
-                (UI thread) so the pill ends stay perfectly round at every step. */}
             <Animated.View style={[styles.circle, circleStyle]} />
-
-            {/* Four bars — same story: real height + borderRadius preserve the
-                pill geometry, while translateX/opacity carry the fan-out. */}
             <Animated.View style={[styles.bar, bar0Style]} />
             <Animated.View style={[styles.bar, bar1Style]} />
             <Animated.View style={[styles.bar, bar2Style]} />

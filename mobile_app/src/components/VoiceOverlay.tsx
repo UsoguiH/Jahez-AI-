@@ -35,10 +35,9 @@ import {
     sendTranscribeChunk,
     TranscribeHandle,
 } from '../lib/transcribeSession';
-import { useSharedValue } from 'react-native-reanimated';
 // Hoisted from inside playAudioChunk — the dynamic import on first call was
 // costing ~50-100ms every time the AI started talking.
-import { appendWavHeader, computeAmplitudeEnvelope, computePeakEnvelopeFast } from '../lib/audioUtils';
+import { appendWavHeader } from '../lib/audioUtils';
 
 // Polyfill for global
 if (!global.btoa) { global.btoa = btoa; }
@@ -133,10 +132,6 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
     const [showFullCart, setShowFullCart] = useState(false);
     const [showCheckout, setShowCheckout] = useState(false);
     const [chatReady, setChatReady] = useState(false);
-    // Live AI-speech amplitude (0..1) consumed by AIVisualizer's UI-thread
-    // equalizer. SharedValue (not useRef) so the visualizer can read it inside
-    // a Reanimated worklet without bridge hops on every frame.
-    const aiAmplitudeShared = useSharedValue(0);
     const [suggestedRestaurants, setSuggestedRestaurants] = useState<{name_ar: string; name_en: string; id: string}[]>([]);
     const [activeRestaurantUI, setActiveRestaurantUI] = useState<Restaurant | null>(null);
     const scrollViewRef = useRef<ScrollView>(null);
@@ -198,24 +193,6 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
     // First batch threshold ≈ 400ms of 24kHz PCM16. Larger = smoother start/less
     // under-run risk; smaller = snappier first-audio latency. 400ms is our sweet spot.
     const STREAM_FIRST_BATCH_MIN_B64 = 12800;
-    // True once the silence watchdog has already flipped the orb to listen
-    // for this turn. Prevents the buffer-drain fallback path from flipping
-    // a second time.
-    const earlyListenFlipDoneRef = useRef<boolean>(false);
-    // Vocal-detection threshold for real-time end-of-speech. Anything below
-    // this in the playback envelope is considered silence.
-    const VOCAL_AMP_THRESHOLD = 0.06;
-    // Wall-clock timestamp of the last inlineData audio chunk we received
-    // from Gemini. Used by the orb-state controller as a "still alive" signal
-    // during the ~500-800 ms window between first chunk arriving and audio
-    // actually starting to play — without it, the controller sees amp=0 and
-    // false-flips to listen before any sound has been heard.
-    const lastChunkAtRef = useRef<number>(0);
-    // Gemini's last batch often has up to ~250ms of trailing silence padding,
-    // and natural inter-word pauses can hit ~200ms. 350ms is the smallest
-    // gap that reliably means "AI is done speaking" without false-flipping
-    // mid-sentence.
-    const SILENCE_FLIP_MS = 350;
 
     // Restaurant menu data — pre-loaded on mic open for zero latency
     const restaurantsRef = useRef<Restaurant[]>([]);
@@ -229,84 +206,6 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
     // the async nature of setState making it see stale values.
     const cartItemsRef = useRef<CartItem[]>([]);
     useEffect(() => { cartItemsRef.current = cartItems; }, [cartItems]);
-
-    // ── Continuous orb-state controller ────────────────────────────────────
-    // Permanently-running 50 ms loop that drives the orb state purely from
-    // real-time AI amplitude. No coupling to audio buffers, batches, or
-    // turnComplete signals — those were all unreliable timing sources.
-    //
-    // Rules:
-    //   • If amp > VOCAL_AMP_THRESHOLD continuously for ≥ 80 ms → respond.
-    //   • If amp ≤ VOCAL_AMP_THRESHOLD continuously for ≥ 500 ms → listen.
-    //
-    // 500 ms silence rides over inter-word and inter-phrase gaps (typically
-    // < 400 ms) without false-flipping mid-sentence. 80 ms vocal-onset
-    // debounce protects against a single noisy peak retriggering respond.
-    //
-    // The controller is also allowed to flip back to respond if amp resumes
-    // after an early listen-flip (e.g. AI takes a long breath, then keeps
-    // talking) — so it's self-correcting, not a one-shot.
-    // Mirror of isAiSpeaking React state, readable from the polling loop
-    // below without re-creating the interval on every change.
-    const isAiSpeakingRef = useRef(false);
-    useEffect(() => { isAiSpeakingRef.current = isAiSpeaking; }, [isAiSpeaking]);
-
-    useEffect(() => {
-        let silenceStartTs = 0;
-        let vocalStartTs = 0;
-        const VOCAL_DEBOUNCE_MS = 80;
-        const SILENCE_HANG_MS = 500;
-        const interval = setInterval(() => {
-            if (aiResponseInterruptedRef.current) {
-                silenceStartTs = 0;
-                vocalStartTs = 0;
-                return;
-            }
-            const amp = aiAmplitudeShared.value;
-            const now = Date.now();
-            const orbSpeaking = isAiSpeakingRef.current;
-
-            if (amp > VOCAL_AMP_THRESHOLD) {
-                silenceStartTs = 0;
-                if (vocalStartTs === 0) vocalStartTs = now;
-                if (!orbSpeaking && (now - vocalStartTs) >= VOCAL_DEBOUNCE_MS) {
-                    console.log(`[ORB-CTRL] flip→respond (vocal ${now - vocalStartTs}ms) t=${now}`);
-                    isSpeaking.current = true;
-                    setIsAiSpeaking(true);
-                    if (echoTailTimerRef.current) {
-                        clearTimeout(echoTailTimerRef.current);
-                        echoTailTimerRef.current = null;
-                    }
-                }
-            } else {
-                vocalStartTs = 0;
-                if (silenceStartTs === 0) silenceStartTs = now;
-                // Bootstrap guard: if Gemini sent us an audio chunk in the
-                // last 800 ms but it hasn't started playing yet (envelope
-                // not computed → amp=0), DON'T flip to listen. This is the
-                // gap between "first chunk arrives" and "audio.playAsync
-                // resolves and the first envelope tick fires."
-                const sinceChunk = now - lastChunkAtRef.current;
-                const inBootstrapWindow = lastChunkAtRef.current > 0 && sinceChunk < 800;
-                if (orbSpeaking
-                    && !inBootstrapWindow
-                    && (now - silenceStartTs) >= SILENCE_HANG_MS) {
-                    console.log(`[ORB-CTRL] flip→listen (silence ${now - silenceStartTs}ms, sinceChunk ${sinceChunk}ms) t=${now}`);
-                    aiAmplitudeShared.value = 0;
-                    earlyListenFlipDoneRef.current = true;
-                    setIsAiSpeaking(false);
-                    if (echoTailTimerRef.current) clearTimeout(echoTailTimerRef.current);
-                    echoTailTimerRef.current = setTimeout(() => {
-                        echoTailTimerRef.current = null;
-                        console.log(`[ORB-CTRL] echo-tail elapsed t=${Date.now()}`);
-                        isSpeaking.current = false;
-                    }, 600);
-                }
-            }
-        }, 50);
-        return () => clearInterval(interval);
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, []);
 
     // Animation Values
     const pulseAnim = useRef(new Animated.Value(1)).current;
@@ -920,8 +819,8 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
         // respond→listen transition so the user sees the orb "listen mode" immediately).
         visualizerRef.current?.forceListen();
 
-        // Detach the sound's status callback BEFORE stopping, so a final status update
-        // can't flip isAiSpeaking back on or write to aiAmplitudeShared after we reset.
+        // Detach the sound's status callback BEFORE stopping, so a final
+        // status update can't flip isAiSpeaking back on after we reset.
         const sound = currentSound.current;
         const soundUri = currentSoundUriRef.current;
         if (sound) {
@@ -934,7 +833,6 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
             }
             if (soundUri) FileSystem.deleteAsync(soundUri, { idempotent: true }).catch(() => {});
         }
-        aiAmplitudeShared.value = 0;
 
         const socket = ws.current;
         const itemId = currentResponseItemIdRef.current;
@@ -1985,9 +1883,6 @@ ${combosCatalogForPrompt()}
                                         aiResponseInterruptedRef.current = false;
                                         isSpeaking.current = true;
                                         setIsAiSpeaking(true);
-                                        // New turn — re-arm the silence watchdog so the
-                                        // real-time orb transition runs again.
-                                        earlyListenFlipDoneRef.current = false;
                                         // Cancel any stale echo-tail timer left over from
                                         // the PREVIOUS turn — otherwise it fires inside
                                         // THIS turn and wrongly opens the mic to echo.
@@ -1998,10 +1893,6 @@ ${combosCatalogForPrompt()}
                                     }
                                     audioBuffer.current += part.inlineData.data;
                                     streamingPendingRef.current += part.inlineData.data;
-                                    // Heartbeat for the orb-state controller —
-                                    // proves the AI is actively producing audio
-                                    // even before the first audio frame plays.
-                                    lastChunkAtRef.current = Date.now();
                                     // Start playback as soon as first batch threshold is
                                     // met. Subsequent chunks are picked up automatically
                                     // by the recursive playPendingStreamAudio chain.
@@ -2574,22 +2465,12 @@ ${combosCatalogForPrompt()}
             return;
         }
         if (streamingPendingRef.current.length === 0) {
-            // Nothing queued. If the turn is over, finalize the orb/mic state.
+            // Nothing queued. If the turn is over, the AI is done speaking —
+            // flip the orb back to listen and arm the echo-tail timer so the
+            // mic doesn't immediately pick up the speaker's reverb tail.
             if (streamingTurnEndedRef.current) {
                 streamingTurnEndedRef.current = false;
-                if (earlyListenFlipDoneRef.current) {
-                    // The envelope-driven early-flip already collapsed the orb
-                    // and armed the echo-tail timer when the voice actually
-                    // ended. Nothing left to do here — bailing out prevents a
-                    // redundant second flip and a doubled echo-tail timer.
-                    console.log(`[ORB] flip→listen skipped (already early-flipped) t=${Date.now()}`);
-                    return;
-                }
-                // Fallback path: no envelope was ever computed (very short
-                // batch, or playback ended before envelope kicked in). Flip
-                // the orb here so we don't get stuck in 'respond'.
-                aiAmplitudeShared.value = 0;
-                console.log(`[ORB] flip→listen (fallback, buffer drained) t=${Date.now()}`);
+                console.log(`[ORB] flip→listen (buffer drained) t=${Date.now()}`);
                 setIsAiSpeaking(false);
                 if (echoTailTimerRef.current) clearTimeout(echoTailTimerRef.current);
                 echoTailTimerRef.current = setTimeout(() => {
@@ -2635,15 +2516,6 @@ ${combosCatalogForPrompt()}
         }
 
         let newSound: Audio.Sound | null = null;
-        // Envelope is computed AFTER playAsync resolves (see setTimeout below).
-        // It starts empty so the first few progress ticks see length 0 and
-        // leave aiAmplitudeShared at 0 — by the time real amplitude kicks in
-        // (~10-20 ms after audio starts), the visualizer's procedural idle
-        // animation is already moving the bars, so the transition looks
-        // seamless. This ordering is what lets audio init be immediate while
-        // still giving real amplitude-driven bars during the chunk.
-        let envelope: number[] = [];
-        const envelopeFps = 30;
         // Hoisted so the catch block (and any cleanup path) can delete the WAV
         // even when failure happens after the file was written.
         const uri = (FileSystem.cacheDirectory || FileSystem.documentDirectory || '')
@@ -2653,12 +2525,9 @@ ${combosCatalogForPrompt()}
             await FileSystem.writeAsStringAsync(uri, wavData, { encoding: FileSystem.EncodingType.Base64 });
             if (aiResponseInterruptedRef.current) { streamingBusyRef.current = false; return; }
 
-            // 50ms poll (20 Hz) — fine-grained enough for the bars to visibly
-            // react to each syllable, but coarse enough that bridge callback
-            // traffic doesn't starve other JS work during AI speech.
             const created = await Audio.Sound.createAsync(
                 { uri },
-                { progressUpdateIntervalMillis: 50 }
+                { progressUpdateIntervalMillis: 100 }
             );
             newSound = created.sound;
             if (aiResponseInterruptedRef.current) {
@@ -2672,40 +2541,14 @@ ${combosCatalogForPrompt()}
             currentSoundUriRef.current = uri;
             await newSound.playAsync();
 
-            // Envelope computation, deferred to AFTER playAsync resolves. This
-            // is the key fix that gives us real-amplitude bars WITHOUT blocking
-            // the audio-start critical path: by the time this runs, the audio
-            // is already playing on the native side, so the ~4-8 ms this now
-            // takes (computePeakEnvelopeFast — peak-based, strided) costs us
-            // nothing visible. Guarded against post-interrupt races.
-            setTimeout(() => {
-                if (aiResponseInterruptedRef.current) return;
-                if (currentSound.current !== newSound) return;
-                envelope = computePeakEnvelopeFast(batch, 24000, envelopeFps);
-            }, 0);
-
             newSound.setOnPlaybackStatusUpdate((status: any) => {
                 if (aiResponseInterruptedRef.current) return;
                 if (status.isLoaded) {
                     if (status.isPlaying && !status.didJustFinish) {
                         playbackPositionMsRef.current = status.positionMillis;
-                        // Drive the visualizer bars from the real envelope.
-                        // If the envelope hasn't been computed yet (first few
-                        // ticks after playAsync), amplitude stays at 0 and
-                        // the visualizer falls through to its idle procedural
-                        // animation — zero visual glitch during the handover.
-                        if (envelope.length > 0) {
-                            const idx = Math.floor((status.positionMillis / 1000) * envelopeFps);
-                            aiAmplitudeShared.value = envelope[idx] ?? 0;
-                        }
-                        // The orb-flip decision lives in the silence watchdog
-                        // useEffect below — decoupled from this callback so it
-                        // keeps polling even between batches and even when this
-                        // sound's progress updates have a gap.
                     }
                     if (status.didJustFinish) {
                         console.log(`[BATCH] didJustFinish t=${Date.now()} pendLen=${streamingPendingRef.current.length} turnEnded=${streamingTurnEndedRef.current}`);
-                        aiAmplitudeShared.value = 0;
                         playbackPositionMsRef.current = 0;
                         try { newSound!.unloadAsync(); } catch {}
                         FileSystem.deleteAsync(uri, { idempotent: true }).catch(() => {});
@@ -2766,13 +2609,6 @@ ${combosCatalogForPrompt()}
             }
             if (aiResponseInterruptedRef.current) return;
 
-            const { appendWavHeader, computeAmplitudeEnvelope } = await import('../lib/audioUtils');
-            if (aiResponseInterruptedRef.current) return;
-
-            // Pre-compute amplitude envelope at 30 FPS so the visualizer bars track real speech loudness.
-            const envelope = computeAmplitudeEnvelope(pcmBase64, 24000, 30);
-            const envelopeFps = 30;
-
             const wavData = appendWavHeader(pcmBase64);
             const uri = (FileSystem.cacheDirectory || FileSystem.documentDirectory || '') + `response_${Date.now()}.wav`;
             await FileSystem.writeAsStringAsync(uri, wavData, { encoding: FileSystem.EncodingType.Base64 });
@@ -2783,7 +2619,7 @@ ${combosCatalogForPrompt()}
 
             const { sound: newSound } = await Audio.Sound.createAsync(
                 { uri },
-                { progressUpdateIntervalMillis: 33 }
+                { progressUpdateIntervalMillis: 100 }
             );
             // If we were interrupted while the sound was loading, throw it away
             // instead of starting playback.
@@ -2802,11 +2638,8 @@ ${combosCatalogForPrompt()}
                 if (status.isLoaded) {
                     if (status.isPlaying && !status.didJustFinish) {
                         playbackPositionMsRef.current = status.positionMillis;
-                        const idx = Math.floor((status.positionMillis / 1000) * envelopeFps);
-                        aiAmplitudeShared.value = envelope[idx] ?? 0;
                     }
                     if (status.didJustFinish) {
-                        aiAmplitudeShared.value = 0;
                         playbackPositionMsRef.current = 0;
                         currentResponseItemIdRef.current = null;
                         newSound.unloadAsync();
@@ -3135,7 +2968,7 @@ ${combosCatalogForPrompt()}
 
                     {/* AI Audio Visualizer — circle (listening) ↔ bars (responding, driven by live AI audio) */}
                     {chatReady && (
-                        <AIVisualizer ref={visualizerRef} state={isAiSpeaking ? 'respond' : 'listen'} amplitudeShared={aiAmplitudeShared} />
+                        <AIVisualizer ref={visualizerRef} state={isAiSpeaking ? 'respond' : 'listen'} />
                     )}
                 </Animated.View>
 

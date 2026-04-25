@@ -3,12 +3,16 @@ import { X, Image as ImageIcon, Signal, Wifi, BatteryMedium } from 'lucide-react
 
 /**
  * Main Application Component
- * * This component simulates a high-end AI voice interface:
- * - A centered visualizer focused on audio interaction.
+ * * This component simulates a high-end AI voice interface with two modes:
+ * - Voice: A centered visualizer focused on audio interaction.
+ * - Vision: A scaled-down visualizer with an image background simulating a camera feed.
  */
 export default function App() {
+  const [mode, setMode] = useState('voice');
   const [state, setState] = useState('listen'); // States: listen, respond
   const [gsapLoaded, setGsapLoaded] = useState(false);
+
+  const isVision = mode === 'vision';
 
   // Load GSAP via CDN to handle complex motion sequences
   useEffect(() => {
@@ -23,6 +27,20 @@ export default function App() {
       
       {/* --- Debug/Control Panel --- */}
       <div className="mb-8 flex flex-col items-center gap-4 bg-white/90 p-6 rounded-[2.5rem] shadow-xl backdrop-blur-xl border border-white">
+        <div className="flex bg-gray-200/50 rounded-full p-1 w-full max-w-xs">
+          {['voice', 'vision'].map((m) => (
+            <button
+              key={m}
+              onClick={() => setMode(m)}
+              className={`flex-1 py-2 rounded-full capitalize text-sm font-bold transition-all duration-300 ${
+                mode === m ? 'bg-black text-white shadow-lg' : 'text-gray-500 hover:text-black'
+              }`}
+            >
+              {m}
+            </button>
+          ))}
+        </div>
+        
         <div className="flex flex-wrap justify-center gap-2">
           {['listen', 'respond'].map((s) => (
             <button
@@ -42,8 +60,19 @@ export default function App() {
       <div className="relative w-[340px] h-[720px] bg-white rounded-[4rem] border-[10px] border-[#121212] overflow-hidden shadow-[0_50px_100px_-20px_rgba(0,0,0,0.2)] flex flex-col">
         <Styles />
 
+        {/* Vision Background (Mock Camera Feed) */}
+        <div className={`absolute inset-0 z-0 transition-opacity duration-1000 ${isVision ? 'opacity-100' : 'opacity-0'}`}>
+          {isVision && (
+            <img
+              src="https://images.unsplash.com/photo-1620121692029-d088224ddc74?auto=format&fit=crop&q=80&w=1000"
+              alt="Vision"
+              className="absolute inset-0 w-full h-full object-cover"
+            />
+          )}
+        </div>
+
         {/* iOS Status Bar */}
-        <div className="absolute top-0 w-full h-12 flex justify-between items-center px-8 pt-4 z-50 text-[13px] font-bold text-black">
+        <div className={`absolute top-0 w-full h-12 flex justify-between items-center px-8 pt-4 z-50 text-[13px] font-bold ${isVision ? 'text-white' : 'text-black'}`}>
           <span>9:41</span>
           <div className="flex items-center gap-1.5"><Signal size={14} /><Wifi size={14} /><BatteryMedium size={16} /></div>
         </div>
@@ -52,19 +81,19 @@ export default function App() {
         <div className="absolute top-2.5 left-1/2 -translate-x-1/2 w-[110px] h-[34px] bg-black rounded-3xl z-50" />
 
         {/* Canvas Visualizer Container */}
-        <div className="relative z-10 flex flex-1 flex-col transition-all duration-700 justify-center items-center">
-           <div className="flex justify-center items-center w-full transition-transform duration-700 scale-100">
+        <div className={`relative z-10 flex flex-1 flex-col transition-all duration-700 ${isVision ? 'justify-start pt-20' : 'justify-center items-center'}`}>
+           <div className={`flex justify-center items-center w-full transition-transform duration-700 ${isVision ? 'scale-[0.4]' : 'scale-100'}`}>
               {gsapLoaded && <CanvasVisualizer state={state} />}
            </div>
         </div>
 
         {/* Controls Footer */}
         <div className="relative z-20 w-full h-32 flex justify-between items-center px-10 pb-8">
-           <button className="w-12 h-12 rounded-full flex items-center justify-center transition-all bg-[#F2F0ED] text-gray-700">
+           <button className={`w-12 h-12 rounded-full flex items-center justify-center transition-all ${isVision ? 'bg-white/90 shadow-lg text-black' : 'bg-[#F2F0ED] text-gray-700'}`}>
               <ImageIcon size={22} />
            </button>
            
-           <div className="flex flex-col items-center justify-center h-16 transition-opacity duration-300">
+           <div className={`flex flex-col items-center justify-center h-16 transition-opacity duration-300`}>
               {state === 'listen' ? (
                 <div className="flex flex-col items-center gap-1">
                   <div className="flex gap-[3.5px]">
@@ -77,7 +106,7 @@ export default function App() {
               )}
            </div>
 
-           <button className="w-12 h-12 rounded-full flex items-center justify-center transition-all bg-[#F2F0ED] text-gray-700">
+           <button className={`w-12 h-12 rounded-full flex items-center justify-center transition-all ${isVision ? 'bg-white/90 shadow-lg text-black' : 'bg-[#F2F0ED] text-gray-700'}`}>
               <X size={24} />
            </button>
         </div>
