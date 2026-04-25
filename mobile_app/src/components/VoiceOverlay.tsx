@@ -37,7 +37,7 @@ import {
 } from '../lib/transcribeSession';
 // Hoisted from inside playAudioChunk — the dynamic import on first call was
 // costing ~50-100ms every time the AI started talking.
-import { appendWavHeader } from '../lib/audioUtils';
+import { appendWavHeader, appendWavHeaderFromChunks } from '../lib/audioUtils';
 
 // Polyfill for global
 if (!global.btoa) { global.btoa = btoa; }
@@ -180,10 +180,19 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
     // --- Gemini streaming playback state ---
     // Instead of buffering the entire AI turn before playing (which makes the user
     // wait ~3-4s from "transcription appears" to "voice starts"), we play chunks as
-    // they arrive. inlineData base64 accumulates in streamingPendingRef until we hit
-    // the first-batch threshold, then we start playing. Subsequent audio that arrives
-    // during playback is drained and played immediately when the current chunk ends.
-    const streamingPendingRef = useRef<string>('');           // unplayed base64 PCM
+    // they arrive. inlineData base64 chunks accumulate in streamingPendingRef until
+    // we hit the first-batch threshold, then we start playing. Subsequent audio
+    // arriving during playback is drained and played when the current chunk ends.
+    //
+    // streamingPendingRef holds an ARRAY of the original base64 chunks (not a
+    // concatenated string). Gemini 3.1 emits many small chunks per turn whose
+    // byte counts are rarely mod-3 aligned, so each chunk usually ends with `=`
+    // padding. Naive string concat produces invalid base64 like "AB=CD" that
+    // atob() rejects, killing the whole batch — audible as stutter/silence.
+    // Decoding each chunk individually (in appendWavHeaderFromChunks) sidesteps
+    // the alignment problem since the server's individual chunks are well-formed.
+    const streamingPendingRef = useRef<string[]>([]);          // unplayed base64 PCM chunks
+    const streamingPendingBytesRef = useRef<number>(0);        // total base64 chars buffered (cheap threshold check)
     const streamingBusyRef = useRef<boolean>(false);           // a chunk is playing now
     const streamingTurnEndedRef = useRef<boolean>(false);      // turnComplete seen, no more chunks
     // Armed while the deferred first-kick setTimeout is pending, so repeated
@@ -191,8 +200,17 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
     // kick after the threshold is first crossed.
     const firstKickPendingRef = useRef<boolean>(false);
     // First batch threshold ≈ 400ms of 24kHz PCM16. Larger = smoother start/less
-    // under-run risk; smaller = snappier first-audio latency. 400ms is our sweet spot.
+    // under-run risk; smaller = snappier first-audio latency.
     const STREAM_FIRST_BATCH_MIN_B64 = 12800;
+    // Subsequent-batch min ≈ 100ms. After the first batch is playing, each
+    // recursive drain spawns a fresh Audio.Sound (Android audio-focus setup
+    // ~30-60ms each). 3.1 emits microscopic chunks (1-10 token frames), so
+    // without a min-drain we churn through dozens of tiny Sounds per turn —
+    // the audible "robotic stutter". When the recursive playback finishes a
+    // batch and finds less than this much queued, wait briefly for more
+    // chunks instead of spawning a new Sound for ~30ms of audio.
+    // Bypass when streamingTurnEndedRef is true (turn over → drain everything).
+    const STREAM_SUBSEQUENT_MIN_B64 = 3200;
 
     // Restaurant menu data — pre-loaded on mic open for zero latency
     const restaurantsRef = useRef<Restaurant[]>([]);
@@ -556,10 +574,12 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
         const targetYs = [160, 255, 350];
         const pillW = Math.min(Dimensions.get('window').width - 80, 300);
 
-        const animations: Animated.CompositeAnimation[] = [];
-
+        // Each phase runs on its own driver to avoid bundling native and JS leaves
+        // into a single Animated.parallel — that pattern throws "JS driven animation
+        // on animated node moved to native earlier". setTimeout sequences the phases
+        // instead of Animated.sequence(Animated.delay(...), ...) so each .start() is
+        // single-driver from RN's point of view.
         dropScales.forEach((s, i) => {
-            // GSAP: set opacity 1, scale 0.5, then animate
             dropOpacities[i].setValue(1);
             dropScales[i].setValue(0.5);
 
@@ -567,32 +587,27 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
             const expandDelay = 500 + i * 120;
             const labelDelay = 800 + i * 120;
 
-            animations.push(
-                Animated.sequence([
-                    Animated.delay(dropDelay),
-                    Animated.parallel([
-                        Animated.spring(dropYs[i], { toValue: targetYs[i], tension: 50, friction: 7, useNativeDriver: true }),
-                        Animated.spring(s, { toValue: 1, tension: 50, friction: 7, useNativeDriver: true })
-                    ])
-                ]),
-                Animated.sequence([
-                    Animated.delay(expandDelay),
-                    Animated.parallel([
-                        Animated.timing(dropWidths[i], { toValue: pillW, duration: 500, easing: Easing.inOut(Easing.cubic), useNativeDriver: false }),
-                        Animated.timing(dropHeights[i], { toValue: 72, duration: 500, easing: Easing.inOut(Easing.cubic), useNativeDriver: false })
-                    ])
-                ]),
-                Animated.sequence([
-                    Animated.delay(labelDelay),
-                    Animated.parallel([
-                        Animated.spring(labelOpacities[i], { toValue: 1, tension: 80, friction: 10, useNativeDriver: true }),
-                        Animated.spring(labelScales[i], { toValue: 1, tension: 80, friction: 10, useNativeDriver: true })
-                    ])
-                ])
-            );
-        });
+            setTimeout(() => {
+                Animated.parallel([
+                    Animated.spring(dropYs[i], { toValue: targetYs[i], tension: 50, friction: 7, useNativeDriver: true }),
+                    Animated.spring(s, { toValue: 1, tension: 50, friction: 7, useNativeDriver: true }),
+                ]).start();
+            }, dropDelay);
 
-        Animated.parallel(animations).start();
+            setTimeout(() => {
+                Animated.parallel([
+                    Animated.timing(dropWidths[i], { toValue: pillW, duration: 500, easing: Easing.inOut(Easing.cubic), useNativeDriver: false }),
+                    Animated.timing(dropHeights[i], { toValue: 72, duration: 500, easing: Easing.inOut(Easing.cubic), useNativeDriver: false }),
+                ]).start();
+            }, expandDelay);
+
+            setTimeout(() => {
+                Animated.parallel([
+                    Animated.spring(labelOpacities[i], { toValue: 1, tension: 80, friction: 10, useNativeDriver: true }),
+                    Animated.spring(labelScales[i], { toValue: 1, tension: 80, friction: 10, useNativeDriver: true }),
+                ]).start();
+            }, labelDelay);
+        });
     };
 
     // =====================================================
@@ -612,18 +627,20 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
         const easeInOut = Easing.bezier(0.4, 0, 0.2, 1); // Material "standard" curve — polished feel
 
         // --- PHASE 1 (0 → 200ms): non-selected pills fade out, all labels fade (label of selected first)
-        Animated.parallel([
-            ...dropOpacities.map((op, i) =>
-                i === idx ? Animated.delay(0) : Animated.timing(op, { toValue: 0, duration: 220, easing: easeOut, useNativeDriver: true })
-            ),
-            ...dropScales.map((sc, i) =>
-                i === idx ? Animated.delay(0) : Animated.timing(sc, { toValue: 0.3, duration: 220, easing: easeOut, useNativeDriver: true })
-            ),
-            ...labelOpacities.map((op) =>
-                Animated.timing(op, { toValue: 0, duration: 180, easing: easeOut, useNativeDriver: true })
-            ),
-            Animated.timing(statusOpacity, { toValue: 0, duration: 200, easing: easeOut, useNativeDriver: true }),
-        ]).start();
+        // All-native parallel — Animated.delay() entries would flag the parallel as
+        // mixed-driver and trigger the JS-vs-native conflict. Skip idx instead.
+        const phase1: Animated.CompositeAnimation[] = [];
+        dropOpacities.forEach((op, i) => {
+            if (i !== idx) phase1.push(Animated.timing(op, { toValue: 0, duration: 220, easing: easeOut, useNativeDriver: true }));
+        });
+        dropScales.forEach((sc, i) => {
+            if (i !== idx) phase1.push(Animated.timing(sc, { toValue: 0.3, duration: 220, easing: easeOut, useNativeDriver: true }));
+        });
+        labelOpacities.forEach((op) => {
+            phase1.push(Animated.timing(op, { toValue: 0, duration: 180, easing: easeOut, useNativeDriver: true }));
+        });
+        phase1.push(Animated.timing(statusOpacity, { toValue: 0, duration: 200, easing: easeOut, useNativeDriver: true }));
+        Animated.parallel(phase1).start();
 
         // --- PHASE 2 (140 → 460ms): selected pill MORPHS from capsule (~pillW × 72) to ball (60 × 60)
         // This is the "cool" part — smooth shape collapse. JS-thread driven (width/height), but isolated
@@ -634,34 +651,32 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
         ]).start();
 
         // --- PHASE 3 (440 → 820ms): the ball glides up toward the orb, orb anticipates ---
-        Animated.parallel([
-            // Ball flies up into the orb's position
-            Animated.timing(dropYs[idx], { toValue: 0, duration: 380, delay: 440, easing: easeInOut, useNativeDriver: true }),
-            // Orb does a subtle squish-anticipation
+        // Each .start() is single-driver. setTimeout sequences the orb-squish chain
+        // instead of Animated.sequence(Animated.delay, ...) inside a parallel — that
+        // mix triggers the JS-vs-native conflict.
+        Animated.timing(dropYs[idx], { toValue: 0, duration: 380, delay: 440, easing: easeInOut, useNativeDriver: true }).start();
+        setTimeout(() => {
             Animated.sequence([
-                Animated.delay(440),
                 Animated.timing(blobTransY, { toValue: 6, duration: 180, easing: easeInOut, useNativeDriver: true }),
                 Animated.timing(blobTransY, { toValue: 0, duration: 260, easing: easeOut, useNativeDriver: true }),
-            ]),
-        ]).start();
+            ]).start();
+        }, 440);
 
         // --- PHASE 4 (780 → 1180ms): absorb — ball fades into orb, orb pops, then lifts ---
-        Animated.parallel([
-            // Ball fades in sync with the absorb pop
-            Animated.timing(dropOpacities[idx], { toValue: 0, duration: 180, delay: 780, easing: easeOut, useNativeDriver: true }),
-            Animated.timing(dropScales[idx], { toValue: 0.85, duration: 180, delay: 780, easing: easeOut, useNativeDriver: true }),
-            // Blob pops outward on impact, then eases down to the visualizer's rest size
-            // (AIVisualizer's CIRCLE_SIZE is 98px = coreBlob 140px × 0.7, so ending blobScale
-            // at 0.7 means the handoff to the visualizer at chatReady is size-matched and the
-            // user sees a smooth shrink instead of a pop-to-smaller on unmount).
+        // Each .start() is single-driver. setTimeout sequences the blob-pop chain
+        // rather than nesting Animated.sequence(Animated.delay, ...) inside a parallel.
+        Animated.timing(dropOpacities[idx], { toValue: 0, duration: 180, delay: 780, easing: easeOut, useNativeDriver: true }).start();
+        Animated.timing(dropScales[idx], { toValue: 0.85, duration: 180, delay: 780, easing: easeOut, useNativeDriver: true }).start();
+        // AIVisualizer's CIRCLE_SIZE is 98px = coreBlob 140px × 0.7, so ending blobScale
+        // at 0.7 means the handoff to the visualizer at chatReady is size-matched and the
+        // user sees a smooth shrink instead of a pop-to-smaller on unmount.
+        setTimeout(() => {
             Animated.sequence([
-                Animated.delay(780),
                 Animated.timing(blobScale, { toValue: 1.2, duration: 200, easing: easeOut, useNativeDriver: true }),
                 Animated.timing(blobScale, { toValue: 0.7, duration: 360, easing: easeInOut, useNativeDriver: true }),
-            ]),
-            // Lift the whole orb container up
-            Animated.timing(orbTransY, { toValue: LIFT, duration: 600, delay: 740, easing: easeInOut, useNativeDriver: true }),
-        ]).start();
+            ]).start();
+        }, 780);
+        Animated.timing(orbTransY, { toValue: LIFT, duration: 600, delay: 740, easing: easeInOut, useNativeDriver: true }).start();
 
         // --- PHASE 5 (880 → 1320ms): header, canvas, bottom bar slide in behind the orb motion ---
         Animated.parallel([
@@ -777,8 +792,13 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
         if (m) {
             barHeightVals.forEach(h => Animated.timing(h, { toValue: 10, duration: 280, useNativeDriver: false }).start());
             barXVals.forEach(x => Animated.timing(x, { toValue: 0, duration: 280, useNativeDriver: false }).start());
+            // barsOpacity must stay JS-driven: barsWrap's children (visBar) have
+            // JS-driven transform translateX from barXVals, and RN's view flattening
+            // collapses those leaf bars into the parent — yielding native opacity +
+            // JS transform on the same node, which throws "JS driven animation on
+            // animated node moved to native earlier". 180ms opacity on JS is fine.
+            Animated.timing(barsOpacity, { toValue: 0, duration: 180, useNativeDriver: false }).start();
             Animated.parallel([
-                Animated.timing(barsOpacity, { toValue: 0, duration: 180, useNativeDriver: true }),
                 Animated.timing(micBtnWidth, { toValue: 76, duration: 240, easing: Easing.out(Easing.cubic), useNativeDriver: false }),
                 Animated.timing(micBtnHeight, { toValue: 76, duration: 240, easing: Easing.out(Easing.cubic), useNativeDriver: false }),
                 Animated.timing(micBtnRadius, { toValue: 38, duration: 240, easing: Easing.out(Easing.cubic), useNativeDriver: false }),
@@ -1832,7 +1852,8 @@ ${combosCatalogForPrompt()}
                             // Clear any streaming-playback state so the recursive
                             // didJustFinish chain exits instead of continuing to
                             // drain buffered audio that the user just talked over.
-                            streamingPendingRef.current = '';
+                            streamingPendingRef.current = [];
+                            streamingPendingBytesRef.current = 0;
                             streamingTurnEndedRef.current = false;
                             streamingBusyRef.current = false;
                             firstKickPendingRef.current = false;
@@ -1919,7 +1940,8 @@ ${combosCatalogForPrompt()}
                                         }
                                     }
                                     audioBuffer.current += part.inlineData.data;
-                                    streamingPendingRef.current += part.inlineData.data;
+                                    streamingPendingRef.current.push(part.inlineData.data);
+                                    streamingPendingBytesRef.current += part.inlineData.data.length;
                                     // Start playback as soon as first batch threshold is
                                     // met. Subsequent chunks are picked up automatically
                                     // by the recursive playPendingStreamAudio chain.
@@ -1934,7 +1956,7 @@ ${combosCatalogForPrompt()}
                                     // kicks stay synchronous so mid-turn chunks don't gap.
                                     if (!streamingBusyRef.current
                                         && !firstKickPendingRef.current
-                                        && streamingPendingRef.current.length >= STREAM_FIRST_BATCH_MIN_B64) {
+                                        && streamingPendingBytesRef.current >= STREAM_FIRST_BATCH_MIN_B64) {
                                         firstKickPendingRef.current = true;
                                         setTimeout(() => {
                                             firstKickPendingRef.current = false;
@@ -1947,7 +1969,7 @@ ${combosCatalogForPrompt()}
 
                         // End of model turn — commit transcripts and play buffered audio.
                         if (sc.turnComplete) {
-                            console.log(`[GEMINI] turnComplete t=${Date.now()} bufLen=${audioBuffer.current.length} pendLen=${streamingPendingRef.current.length} busy=${streamingBusyRef.current}`);
+                            console.log(`[GEMINI] turnComplete t=${Date.now()} bufLen=${audioBuffer.current.length} pendChunks=${streamingPendingRef.current.length} pendBytes=${streamingPendingBytesRef.current} busy=${streamingBusyRef.current}`);
 
                             // Cancel any pending throttled caption flush — the
                             // geminiOutputTranscript is about to be committed to
@@ -1983,7 +2005,8 @@ ${combosCatalogForPrompt()}
                             if (aiResponseInterruptedRef.current) {
                                 // Interrupted mid-turn — drop everything, don't play.
                                 audioBuffer.current = '';
-                                streamingPendingRef.current = '';
+                                streamingPendingRef.current = [];
+                                streamingPendingBytesRef.current = 0;
                                 streamingTurnEndedRef.current = false;
                             } else {
                                 // Tell the streaming pipeline no more chunks are coming.
@@ -2488,7 +2511,8 @@ ${combosCatalogForPrompt()}
     const playPendingStreamAudio = async () => {
         if (streamingBusyRef.current) return;
         if (aiResponseInterruptedRef.current) {
-            streamingPendingRef.current = '';
+            streamingPendingRef.current = [];
+            streamingPendingBytesRef.current = 0;
             return;
         }
         if (streamingPendingRef.current.length === 0) {
@@ -2510,8 +2534,25 @@ ${combosCatalogForPrompt()}
             return;
         }
 
+        // Subsequent-batch min-drain. While the turn is still ongoing, wait
+        // for at least ~100ms of audio before spawning a new Sound — without
+        // this, 3.1's tiny chunks (1-10 tokens per frame) cause one
+        // Audio.Sound spawn per 30ms of audio, which is the audible stutter.
+        // Skip the wait when the turn has ended (drain everything) or when
+        // we haven't started playing yet (let the first-batch threshold gate that).
+        if (streamingBusyRef.current === false
+            && !streamingTurnEndedRef.current
+            && audioBuffer.current.length > 0  // we've already started this turn
+            && streamingPendingBytesRef.current < STREAM_SUBSEQUENT_MIN_B64) {
+            // Re-arm a check shortly — by then more chunks should have arrived
+            // or the turn will have ended.
+            setTimeout(() => { playPendingStreamAudio(); }, 80);
+            return;
+        }
+
         const batch = streamingPendingRef.current;
-        streamingPendingRef.current = '';
+        streamingPendingRef.current = [];
+        streamingPendingBytesRef.current = 0;
         streamingBusyRef.current = true;
 
         // Hard guarantee: only ONE sound object is alive at a time. If a
@@ -2549,7 +2590,7 @@ ${combosCatalogForPrompt()}
         const uri = (FileSystem.cacheDirectory || FileSystem.documentDirectory || '')
             + `stream_${Date.now()}_${Math.random().toString(36).slice(2, 7)}.wav`;
         try {
-            const wavData = appendWavHeader(batch);
+            const wavData = appendWavHeaderFromChunks(batch);
             await FileSystem.writeAsStringAsync(uri, wavData, { encoding: FileSystem.EncodingType.Base64 });
             if (aiResponseInterruptedRef.current) { streamingBusyRef.current = false; return; }
 
@@ -2576,7 +2617,7 @@ ${combosCatalogForPrompt()}
                         playbackPositionMsRef.current = status.positionMillis;
                     }
                     if (status.didJustFinish) {
-                        console.log(`[BATCH] didJustFinish t=${Date.now()} pendLen=${streamingPendingRef.current.length} turnEnded=${streamingTurnEndedRef.current}`);
+                        console.log(`[BATCH] didJustFinish t=${Date.now()} pendChunks=${streamingPendingRef.current.length} pendBytes=${streamingPendingBytesRef.current} turnEnded=${streamingTurnEndedRef.current}`);
                         playbackPositionMsRef.current = 0;
                         try { newSound!.unloadAsync(); } catch {}
                         FileSystem.deleteAsync(uri, { idempotent: true }).catch(() => {});

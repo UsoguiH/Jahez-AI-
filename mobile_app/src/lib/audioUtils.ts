@@ -175,3 +175,32 @@ export const appendWavHeader = (pcmBase64: string, sampleRate = 24000) => {
     // Combine
     return global.btoa(headerStr + binaryString);
 };
+
+// Variant for the streaming playback path: takes an ARRAY of base64 chunks
+// (each as Gemini delivered it) and decodes them individually before
+// concatenating into the binary stream that gets the WAV header.
+//
+// Why this exists: Gemini 3.1 streams many small audio chunks per turn, and
+// each chunk's PCM byte count is rarely mod-3-aligned, so most of them end
+// with `=` padding. Concatenating the base64 strings produces invalid
+// sequences like "...AB=CD..." that atob() rejects with
+// "Found invalid character when decoding base64 string", killing the entire
+// batch and producing audible silence/stutter. Decoding each chunk
+// independently sidesteps the alignment problem entirely — every individual
+// chunk is well-formed base64 from the server.
+export const appendWavHeaderFromChunks = (chunks: string[], sampleRate = 24000) => {
+    let binaryString = '';
+    for (let i = 0; i < chunks.length; i++) {
+        binaryString += global.atob(chunks[i]);
+    }
+    const len = binaryString.length;
+    const header = createWavHeader(len, sampleRate);
+
+    let headerStr = '';
+    const headerBytes = new Uint8Array(header);
+    for (let i = 0; i < headerBytes.length; i++) {
+        headerStr += String.fromCharCode(headerBytes[i]);
+    }
+
+    return global.btoa(headerStr + binaryString);
+};
