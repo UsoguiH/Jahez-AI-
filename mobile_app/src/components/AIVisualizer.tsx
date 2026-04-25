@@ -179,7 +179,11 @@ const AIVisualizer = forwardRef<AIVisualizerHandle, Props>(({ state, amplitudeSh
                 if (Math.random() < 0.02) eqS0.value = 0.20 + Math.random() * 0.30;
                 else eqS0.value *= 0.94;
                 const idle = Math.max(0.22, Math.min(0.90, 0.45 + wave + eqS0.value));
-                const eff = amplitudeShared ? Math.max(amp, idle) : idle;
+                // When real amplitude is available (AI speaking), bars track it
+                // directly so the user can see the moment audio actually goes
+                // silent. The procedural `idle` is only the fallback when there's
+                // no amplitude source — otherwise it masked end-of-speech.
+                const eff = amplitudeShared ? amp : idle;
                 const target = minH + eff * (maxH - minH);
                 eqH0.value += (target - eqH0.value) * BAR_SMOOTHING;
                 b0H.value = eqH0.value;
@@ -195,7 +199,7 @@ const AIVisualizer = forwardRef<AIVisualizerHandle, Props>(({ state, amplitudeSh
                 if (Math.random() < 0.02) eqS1.value = 0.20 + Math.random() * 0.30;
                 else eqS1.value *= 0.94;
                 const idle = Math.max(0.22, Math.min(0.90, 0.45 + wave + eqS1.value));
-                const eff = amplitudeShared ? Math.max(amp, idle) : idle;
+                const eff = amplitudeShared ? amp : idle;
                 const target = minH + eff * (maxH - minH);
                 eqH1.value += (target - eqH1.value) * BAR_SMOOTHING;
                 b1H.value = eqH1.value;
@@ -211,7 +215,7 @@ const AIVisualizer = forwardRef<AIVisualizerHandle, Props>(({ state, amplitudeSh
                 if (Math.random() < 0.02) eqS2.value = 0.20 + Math.random() * 0.30;
                 else eqS2.value *= 0.94;
                 const idle = Math.max(0.22, Math.min(0.90, 0.45 + wave + eqS2.value));
-                const eff = amplitudeShared ? Math.max(amp, idle) : idle;
+                const eff = amplitudeShared ? amp : idle;
                 const target = minH + eff * (maxH - minH);
                 eqH2.value += (target - eqH2.value) * BAR_SMOOTHING;
                 b2H.value = eqH2.value;
@@ -227,7 +231,7 @@ const AIVisualizer = forwardRef<AIVisualizerHandle, Props>(({ state, amplitudeSh
                 if (Math.random() < 0.02) eqS3.value = 0.20 + Math.random() * 0.30;
                 else eqS3.value *= 0.94;
                 const idle = Math.max(0.22, Math.min(0.90, 0.45 + wave + eqS3.value));
-                const eff = amplitudeShared ? Math.max(amp, idle) : idle;
+                const eff = amplitudeShared ? amp : idle;
                 const target = minH + eff * (maxH - minH);
                 eqH3.value += (target - eqH3.value) * BAR_SMOOTHING;
                 b3H.value = eqH3.value;

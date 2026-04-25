@@ -1885,6 +1885,7 @@ ${combosCatalogForPrompt()}
                             for (const part of sc.modelTurn.parts) {
                                 if (part.inlineData?.data) {
                                     if (audioBuffer.current.length === 0) {
+                                        console.log(`[ORB] flip→respond (first chunk) t=${Date.now()}`);
                                         aiResponseInterruptedRef.current = false;
                                         isSpeaking.current = true;
                                         setIsAiSpeaking(true);
@@ -1925,7 +1926,7 @@ ${combosCatalogForPrompt()}
 
                         // End of model turn — commit transcripts and play buffered audio.
                         if (sc.turnComplete) {
-                            console.log('[GEMINI] turnComplete, audio buffer length:', audioBuffer.current.length);
+                            console.log(`[GEMINI] turnComplete t=${Date.now()} bufLen=${audioBuffer.current.length} pendLen=${streamingPendingRef.current.length} busy=${streamingBusyRef.current}`);
 
                             // Cancel any pending throttled caption flush — the
                             // geminiOutputTranscript is about to be committed to
@@ -2482,11 +2483,12 @@ ${combosCatalogForPrompt()}
                 // to the same timeout was the ~2-second "visualizer still
                 // bouncing after AI stopped" lag.
                 aiAmplitudeShared.value = 0;
+                console.log(`[ORB] flip→listen t=${Date.now()}`);
                 setIsAiSpeaking(false);
                 if (echoTailTimerRef.current) clearTimeout(echoTailTimerRef.current);
                 echoTailTimerRef.current = setTimeout(() => {
                     echoTailTimerRef.current = null;
-                    console.log('Streaming echo-tail elapsed — resuming mic');
+                    console.log(`[ORB] echo-tail elapsed t=${Date.now()}`);
                     isSpeaking.current = false;
                 }, 600);
             }
@@ -2592,6 +2594,7 @@ ${combosCatalogForPrompt()}
                         }
                     }
                     if (status.didJustFinish) {
+                        console.log(`[BATCH] didJustFinish t=${Date.now()} pendLen=${streamingPendingRef.current.length} turnEnded=${streamingTurnEndedRef.current}`);
                         aiAmplitudeShared.value = 0;
                         playbackPositionMsRef.current = 0;
                         try { newSound!.unloadAsync(); } catch {}
@@ -2774,26 +2777,33 @@ ${combosCatalogForPrompt()}
                         if (val > maxPeak) maxPeak = val;
                     }
                     
-                    // --- ULTRA SENSITIVE UX CURVE ---
-                    // 1. Peak Noise Gate: ignores static room noise (AC, fan, typing)
-                    //    and speaker-echo tail. 400 is the sweet spot — still clears most
-                    //    ambient, but catches soft speech and the start of a word.
-                    let effectiveAmp = Math.max(0, maxPeak - 400);
+                    // --- UX CURVE ---
+                    // 1. Peak Noise Gate: 400 was too low — fans/AC/breathing peak at
+                    //    500-700 raw int16 and were tripping the bars when the user was
+                    //    silent. 800 reliably clears typical ambient while still catching
+                    //    soft speech (which peaks ~900+).
+                    let effectiveAmp = Math.max(0, maxPeak - 800);
 
-                    // 2. Sensitivity Ceiling — a normal speaking voice peaks around ~900-1100
-                    //    in raw int16; dropping the ceiling from 1500 to 900 means ordinary
-                    //    conversation maxes out the bars, instead of only shouting doing so.
-                    let rawNorm = Math.min(effectiveAmp, 900) / 900;
+                    // 2. Sensitivity Ceiling — normal speaking voice peaks around ~900-1100
+                    //    in raw int16; gate-subtracted it lands around 100-300, so a 300
+                    //    ceiling means ordinary conversation maxes out the bars.
+                    let rawNorm = Math.min(effectiveAmp, 300) / 300;
 
-                    // 3. Logarithmic Hearing Curve: pow 0.5 boosts whispers harder than 0.6
-                    //    did, so the bars feel alive even on quiet utterances.
-                    let normRaw = Math.pow(rawNorm, 0.5);
+                    // 3. Hearing Curve: pow 0.6 still boosts soft speech but is less
+                    //    aggressive than 0.5 — keeps near-silence visually quiet.
+                    let normRaw = Math.pow(rawNorm, 0.6);
 
-                    // 4. Rhythm Bouncing: 78% attack for fast-but-smooth rise (no jerky snap),
+                    // 4. Hard floor: anything that gets through the gate but still lands
+                    //    near zero (residual ambient transients) snaps to 0 so the bars
+                    //    actually settle when the user is silent.
+                    if (normRaw < 0.04) normRaw = 0;
+
+                    // 5. Rhythm Bouncing: 78% attack for fast-but-smooth rise (no jerky snap),
                     //    40% decay so bars glide back down naturally instead of hanging.
                     let last = currentMicVolumeRef.current;
                     let v = normRaw > last ? (last * 0.22 + normRaw * 0.78) : (last * 0.6 + normRaw * 0.4);
-                    
+                    if (v < 0.01) v = 0;
+
                     currentMicVolumeRef.current = v;
                 } catch (e) {
                     console.warn("Volume calc err:", e);
