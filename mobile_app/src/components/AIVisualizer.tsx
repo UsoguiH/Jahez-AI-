@@ -45,13 +45,18 @@ const JITTER_SMOOTHING = 0.12;
 
 const AIVisualizer = forwardRef<AIVisualizerHandle, Props>(({ state, amplitudeRef }, ref) => {
     // --- Circle / blob ---
-    // Circle animates layout props (width/height/borderRadius) plus scale — all on
-    // the same view, so they must share one driver. Stays JS-driven.
+    // Split-driver: the OUTER wrapper owns transform (scale) + opacity and runs
+    // on the native (UI-thread) driver, so the listening-state jitter and the
+    // fade on entry/exit stay at 60 fps even when the JS thread is busy with
+    // WebSocket / audio pipeline work. The INNER view owns the width/height/
+    // borderRadius shape morph — those are layout props that can't run native,
+    // but the pill→tall-bar→circle keyframes need the EXACT dimensions
+    // (scaleY would flatten the pill ends), so this pair stays JS-driven.
     const circleW = useRef(new Animated.Value(CIRCLE_SIZE)).current;
     const circleH = useRef(new Animated.Value(CIRCLE_SIZE)).current;
     const circleR = useRef(new Animated.Value(CIRCLE_SIZE / 2)).current;
-    const circleOpacity = useRef(new Animated.Value(1)).current;
-    const circleScale = useRef(new Animated.Value(1)).current;
+    const circleOpacity = useRef(new Animated.Value(1)).current;   // on outer view, native
+    const circleScale = useRef(new Animated.Value(1)).current;     // on outer view, native
 
     // --- Ripples --- (native driver — their view has no JS-animated layout props)
     const r0Scale = useRef(new Animated.Value(1)).current;
@@ -60,8 +65,12 @@ const AIVisualizer = forwardRef<AIVisualizerHandle, Props>(({ state, amplitudeRe
     const r1Opacity = useRef(new Animated.Value(0)).current;
 
     // --- Bars ---
-    // Bars animate both height (layout) and translateX (transform) on the same view.
-    // Drivers must match, so everything on the bar view stays JS-driven.
+    // Same split trick: outer wrapper carries translateX + opacity (native),
+    // inner carries height (JS, preserves pill-end borderRadius geometry).
+    // The fan-out motion (translateX) runs on the UI thread so it never
+    // stutters during the first audio chunks; the per-bar height still updates
+    // on JS at 60 Hz during the equalizer, but that's 4 setValue calls per
+    // frame — cheap enough to survive JS-thread bursts.
     const b0H = useRef(new Animated.Value(0)).current;
     const b1H = useRef(new Animated.Value(0)).current;
     const b2H = useRef(new Animated.Value(0)).current;
@@ -160,8 +169,14 @@ const AIVisualizer = forwardRef<AIVisualizerHandle, Props>(({ state, amplitudeRe
 
             // Exponential smoothing — same visual softness as the old sine.inOut tweens
             // without allocating an Animated.timing instance per cycle.
-            currentHeights.current[i] += (targetHeight - currentHeights.current[i]) * BAR_SMOOTHING;
-            bars[i].h.setValue(currentHeights.current[i]);
+            const prev = currentHeights.current[i];
+            const next = prev + (targetHeight - prev) * BAR_SMOOTHING;
+            currentHeights.current[i] = next;
+            // Skip sub-pixel updates so the JS-bridge setValue traffic during
+            // equalizer doesn't starve the WS/audio callbacks at 60 Hz × 4 bars.
+            if (Math.abs(next - prev) >= 0.5) {
+                bars[i].h.setValue(next);
+            }
         }
 
         eqRafId.current = requestAnimationFrame(tickEqualizer);
@@ -201,8 +216,9 @@ const AIVisualizer = forwardRef<AIVisualizerHandle, Props>(({ state, amplitudeRe
     };
 
     // Jitter driven by a single RAF loop. Repicks a random target every ~100–200ms
-    // and exponentially smooths toward it — matches the old Animated.timing pulse feel
-    // without allocating a new tween per cycle.
+    // and exponentially smooths toward it. circleScale is on the native driver now,
+    // so setValue still works (it's driver-agnostic) and the breathing motion runs
+    // on the UI thread regardless of JS load.
     const tickJitter = () => {
         if (!mounted.current || !jitterActive.current) return;
         const now = Date.now();
@@ -216,8 +232,12 @@ const AIVisualizer = forwardRef<AIVisualizerHandle, Props>(({ state, amplitudeRe
             jitterTarget.current = 1 + Math.random() * 0.12;
             jitterNextPick.current = now + 100 + Math.random() * 100;
         }
-        currentJitter.current += (jitterTarget.current - currentJitter.current) * JITTER_SMOOTHING;
-        circleScale.setValue(currentJitter.current);
+        const prev = currentJitter.current;
+        const next = prev + (jitterTarget.current - prev) * JITTER_SMOOTHING;
+        currentJitter.current = next;
+        if (Math.abs(next - prev) >= 0.001) {
+            circleScale.setValue(next);
+        }
 
         jitterRafId.current = requestAnimationFrame(tickJitter);
     };
@@ -297,6 +317,11 @@ const AIVisualizer = forwardRef<AIVisualizerHandle, Props>(({ state, amplitudeRe
     }));
 
     // --- State transitions (one-shot animations, not hot paths) ---
+    // Each phase splits into two Animated.parallel groups by driver:
+    // one for the native-driver outer wrapper props (scale, opacity, translateX),
+    // one for the JS-driver inner view props (width, height, borderRadius).
+    // The `.start(cb)` that sequences phases hangs off the JS group so the
+    // shape morph (which is the slower, layout-bound half) controls timing.
     useEffect(() => {
         if (state === 'listen') {
             stopEqualizer();
@@ -304,16 +329,20 @@ const AIVisualizer = forwardRef<AIVisualizerHandle, Props>(({ state, amplitudeRe
             const barsVisible = (b0O as any)._value > 0;
 
             if (barsVisible) {
-                Animated.parallel([
-                    ...bars.map(bar => Animated.timing(bar.x, { toValue: 0, duration: 350, easing: easeExpoInOut, useNativeDriver: false })),
-                    ...bars.map(bar => Animated.timing(bar.h, { toValue: TALL_BAR_H, duration: 350, easing: easeExpoInOut, useNativeDriver: false })),
-                ]).start(() => {
+                // Bars collapse: translateX + opacity on native, height on JS.
+                Animated.parallel(
+                    bars.map(bar => Animated.timing(bar.x, { toValue: 0, duration: 350, easing: easeExpoInOut, useNativeDriver: true }))
+                ).start();
+                Animated.parallel(
+                    bars.map(bar => Animated.timing(bar.h, { toValue: TALL_BAR_H, duration: 350, easing: easeExpoInOut, useNativeDriver: false }))
+                ).start(() => {
                     bars.forEach(bar => bar.o.setValue(0));
                     circleOpacity.setValue(1);
                     circleW.setValue(BAR_WIDTH);
                     circleH.setValue(TALL_BAR_H);
                     circleR.setValue(BAR_WIDTH / 2);
                     circleScale.setValue(1);
+                    // Re-expand circle: layout on JS (shape morph must be exact).
                     Animated.parallel([
                         Animated.timing(circleW, { toValue: CIRCLE_SIZE, duration: 500, easing: easeBackOut15, useNativeDriver: false }),
                         Animated.timing(circleH, { toValue: CIRCLE_SIZE, duration: 500, easing: easeBackOut15, useNativeDriver: false }),
@@ -338,14 +367,14 @@ const AIVisualizer = forwardRef<AIVisualizerHandle, Props>(({ state, amplitudeRe
                 Animated.timing(r1Opacity, { toValue: 0, duration: 200, useNativeDriver: true }),
             ]).start();
 
-            // Phase 1: squish to pill
+            // Phase 1: squish to pill — circleScale (native) + layout (JS) split.
+            Animated.timing(circleScale, { toValue: 1, duration: 180, easing: easeExpoInOut, useNativeDriver: true }).start();
             Animated.parallel([
                 Animated.timing(circleW, { toValue: PILL_W, duration: 180, easing: easeExpoInOut, useNativeDriver: false }),
                 Animated.timing(circleH, { toValue: PILL_H, duration: 180, easing: easeExpoInOut, useNativeDriver: false }),
                 Animated.timing(circleR, { toValue: PILL_R, duration: 180, easing: easeExpoInOut, useNativeDriver: false }),
-                Animated.timing(circleScale, { toValue: 1, duration: 180, easing: easeExpoInOut, useNativeDriver: false }),
             ]).start(() => {
-                // Phase 2: crunch to single tall bar
+                // Phase 2: crunch to single tall bar (layout only)
                 Animated.parallel([
                     Animated.timing(circleW, { toValue: BAR_WIDTH, duration: 150, easing: easeExpoIn, useNativeDriver: false }),
                     Animated.timing(circleH, { toValue: TALL_BAR_H, duration: 150, easing: easeExpoIn, useNativeDriver: false }),
@@ -358,11 +387,13 @@ const AIVisualizer = forwardRef<AIVisualizerHandle, Props>(({ state, amplitudeRe
                         bar.h.setValue(TALL_BAR_H);
                     });
 
-                    // Phase 3: bars fan out
-                    Animated.parallel([
-                        ...bars.map((bar, i) => Animated.timing(bar.x, { toValue: X_TARGETS[i], duration: 450, delay: i * 30, easing: easeBackOut18, useNativeDriver: false })),
-                        ...bars.map((bar, i) => Animated.timing(bar.h, { toValue: BAR_BASE_HEIGHTS[i], duration: 450, delay: i * 30, easing: easeBackOut18, useNativeDriver: false })),
-                    ]).start(() => {
+                    // Phase 3: bars fan out — translateX native, height JS.
+                    Animated.parallel(
+                        bars.map((bar, i) => Animated.timing(bar.x, { toValue: X_TARGETS[i], duration: 450, delay: i * 30, easing: easeBackOut18, useNativeDriver: true }))
+                    ).start();
+                    Animated.parallel(
+                        bars.map((bar, i) => Animated.timing(bar.h, { toValue: BAR_BASE_HEIGHTS[i], duration: 450, delay: i * 30, easing: easeBackOut18, useNativeDriver: false }))
+                    ).start(() => {
                         startEqualizer();
                     });
                 });
@@ -376,35 +407,56 @@ const AIVisualizer = forwardRef<AIVisualizerHandle, Props>(({ state, amplitudeRe
             <Animated.View style={[styles.ripple, { opacity: r0Opacity, transform: [{ scale: r0Scale }] }]} />
             <Animated.View style={[styles.ripple, { opacity: r1Opacity, transform: [{ scale: r1Scale }] }]} />
 
-            {/* Circle / blob */}
+            {/* Circle / blob — outer (native) handles scale + opacity, inner (JS)
+                handles the width/height/borderRadius shape morph. Same exact
+                pixel output as a single view, but the listening-state jitter
+                and entry/exit fade stay on the UI thread at 60 fps. */}
             <Animated.View
                 style={[
-                    styles.circle,
+                    styles.circleOuter,
                     {
-                        width: circleW,
-                        height: circleH,
-                        borderRadius: circleR,
                         opacity: circleOpacity,
                         transform: [{ scale: circleScale }],
                     },
                 ]}
-            />
+            >
+                <Animated.View
+                    style={[
+                        styles.circle,
+                        {
+                            width: circleW,
+                            height: circleH,
+                            borderRadius: circleR,
+                        },
+                    ]}
+                />
+            </Animated.View>
 
-            {/* Bars */}
+            {/* Bars — outer (native) handles translateX + opacity, inner (JS)
+                animates real height so the pill-end borderRadius stays exact
+                at every bar size. */}
             {bars.map((bar, i) => (
                 <Animated.View
                     key={`bar-${i}`}
                     style={[
-                        styles.bar,
+                        styles.barOuter,
                         {
-                            width: BAR_WIDTH,
-                            height: bar.h,
-                            borderRadius: BAR_WIDTH / 2,
                             opacity: bar.o,
                             transform: [{ translateX: bar.x }],
                         },
                     ]}
-                />
+                >
+                    <Animated.View
+                        style={[
+                            styles.bar,
+                            {
+                                width: BAR_WIDTH,
+                                height: bar.h,
+                                borderRadius: BAR_WIDTH / 2,
+                            },
+                        ]}
+                    />
+                </Animated.View>
             ))}
         </View>
     );
@@ -424,12 +476,29 @@ const styles = StyleSheet.create({
         borderRadius: CIRCLE_SIZE / 2,
         backgroundColor: 'rgba(0,0,0,0.1)',
     },
-    circle: {
+    // Outer wrapper is absolute-positioned and flex-centered so the inner shape
+    // stays anchored at container center regardless of its animated size.
+    // The outer has no size of its own — it wraps its content — so `scale`
+    // applied here multiplies the inner's rendered size, matching the original
+    // single-view behavior exactly.
+    circleOuter: {
         position: 'absolute',
+        alignItems: 'center',
+        justifyContent: 'center',
+    },
+    circle: {
         backgroundColor: '#000',
     },
-    bar: {
+    // Same pattern as circleOuter — position:absolute centers it in the
+    // container, no explicit size so translateX shifts the whole wrapper
+    // and the inner bar's variable height stays centered around the wrapper's
+    // anchor point (matches original absolute+centered bar behavior).
+    barOuter: {
         position: 'absolute',
+        alignItems: 'center',
+        justifyContent: 'center',
+    },
+    bar: {
         backgroundColor: '#000',
     },
 });
