@@ -172,16 +172,6 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
     // Tracked as a ref so a new AI turn starting mid-grace can cancel it — otherwise
     // the old timer fires inside the new turn and wrongly opens the mic.
     const echoTailTimerRef = useRef<any>(null);
-    // Safety-net timer for the orb listen-transition. The "primary" path waits
-    // for streamingTurnEndedRef (server's turnComplete) AND empty pending, but
-    // turnComplete can lag the actual end-of-audio by several seconds on long
-    // turns (tool calls, internal reasoning extending the server-side turn
-    // even after the user-perceptible audio is done). When the audio buffer
-    // has been idle for > AUDIO_IDLE_END_MS without a new chunk arriving, we
-    // treat it as end-of-speech and flip the orb regardless of turnComplete.
-    // Cancelled when new chunks arrive so it never fires mid-turn.
-    const audioIdleTimerRef = useRef<any>(null);
-    const AUDIO_IDLE_END_MS = 500;
 
     // Caption-throttle state. Gemini's outputTranscription deltas arrive at
     // 10-30 Hz; each used to fire a setCurrentAiText which re-renders the
@@ -337,7 +327,6 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
             stopPulseAnimation();
             if (waveIntervalRef.current) { clearInterval(waveIntervalRef.current); waveIntervalRef.current = null; }
             if (breathTweenRef.current) { breathTweenRef.current.stop(); breathTweenRef.current = null; }
-            if (audioIdleTimerRef.current) { clearTimeout(audioIdleTimerRef.current); audioIdleTimerRef.current = null; }
             barAnimRefs.current.forEach(a => a?.stop()); barAnimRefs.current = [];
             if (ws.current) {
                 console.log('Closing WebSocket...');
@@ -865,10 +854,6 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
         currentResponseItemIdRef.current = null;
         playbackPositionMsRef.current = 0;
         audioBuffer.current = '';
-        if (audioIdleTimerRef.current) {
-            clearTimeout(audioIdleTimerRef.current);
-            audioIdleTimerRef.current = null;
-        }
         isSpeaking.current = false;
         setIsAiSpeaking(false);
 
@@ -1837,10 +1822,6 @@ ${combosCatalogForPrompt()}
                             streamingTurnEndedRef.current = false;
                             streamingBusyRef.current = false;
                             firstKickPendingRef.current = false;
-                            if (audioIdleTimerRef.current) {
-                                clearTimeout(audioIdleTimerRef.current);
-                                audioIdleTimerRef.current = null;
-                            }
                             const sound = currentSound.current;
                             const soundUri = currentSoundUriRef.current;
                             if (sound) {
@@ -1901,21 +1882,12 @@ ${combosCatalogForPrompt()}
                         // retained purely as a "first-chunk-of-turn" marker for arming
                         // isSpeaking/clearing the interrupt flag.
                         if (sc.modelTurn?.parts && !aiResponseInterruptedRef.current) {
-                            // Any new chunk arrival is "audio is alive" — kill
-                            // the safety-net idle timer if one is armed. This
-                            // is what keeps the timer from firing during natural
-                            // micro-pauses within a turn.
-                            if (audioIdleTimerRef.current) {
-                                clearTimeout(audioIdleTimerRef.current);
-                                audioIdleTimerRef.current = null;
-                            }
                             for (const part of sc.modelTurn.parts) {
                                 if (part.inlineData?.data) {
                                     if (audioBuffer.current.length === 0) {
                                         aiResponseInterruptedRef.current = false;
                                         isSpeaking.current = true;
                                         setIsAiSpeaking(true);
-                                        console.log('[ORB] flip→respond (first chunk of turn)');
                                         // Cancel any stale echo-tail timer left over from
                                         // the PREVIOUS turn — otherwise it fires inside
                                         // THIS turn and wrongly opens the mic to echo.
@@ -1991,10 +1963,6 @@ ${combosCatalogForPrompt()}
                                 audioBuffer.current = '';
                                 streamingPendingRef.current = '';
                                 streamingTurnEndedRef.current = false;
-                                if (audioIdleTimerRef.current) {
-                                    clearTimeout(audioIdleTimerRef.current);
-                                    audioIdleTimerRef.current = null;
-                                }
                             } else {
                                 // Tell the streaming pipeline no more chunks are coming.
                                 // If a chunk is currently playing, the recursive
@@ -2491,32 +2459,6 @@ ${combosCatalogForPrompt()}
         }
     };
 
-    // Single source of truth for "AI finished speaking, flip the orb back to
-    // listen". Called by the fast path (turnComplete + buffer drained) AND
-    // the safety net (audio-idle timer). Idempotent: callable multiple times
-    // without flicker (React no-ops setState if value unchanged).
-    const finishAiTurnSpeech = (reason: string) => {
-        if (audioIdleTimerRef.current) {
-            clearTimeout(audioIdleTimerRef.current);
-            audioIdleTimerRef.current = null;
-        }
-        streamingTurnEndedRef.current = false;
-        // Reset audioBuffer so that if late chunks arrive (next turn or stray
-        // post-flip chunks), the modelTurn handler's first-chunk-of-turn
-        // detection at `if (audioBuffer.current.length === 0)` re-arms
-        // setIsAiSpeaking(true) properly.
-        audioBuffer.current = '';
-        aiAmplitudeShared.value = 0;
-        setIsAiSpeaking(false);
-        console.log(`[ORB] flip→listen (${reason})`);
-        if (echoTailTimerRef.current) clearTimeout(echoTailTimerRef.current);
-        echoTailTimerRef.current = setTimeout(() => {
-            echoTailTimerRef.current = null;
-            console.log('Streaming echo-tail elapsed — resuming mic');
-            isSpeaking.current = false;
-        }, 600);
-    };
-
     // Streaming playback for Gemini: drains streamingPendingRef as a fresh WAV,
     // plays it, and on finish recursively plays whatever else accumulated during
     // that playback. When the queue empties and the turn has ended, arms the
@@ -2528,30 +2470,25 @@ ${combosCatalogForPrompt()}
             return;
         }
         if (streamingPendingRef.current.length === 0) {
-            // Nothing queued. Two paths to flip the orb back to listen:
-            //
-            // FAST PATH — server signaled turnComplete: flip immediately.
-            // SAFETY NET — turnComplete hasn't arrived yet but the audio has
-            // been idle. We can't trust turnComplete alone because Gemini Live
-            // can delay it for several seconds past actual end-of-audio when
-            // tool calls or trailing internal reasoning extend the server-side
-            // turn. The audio truly ending is the user-meaningful signal, so
-            // we arm a timer; if no new chunk shows up within AUDIO_IDLE_END_MS
-            // we treat it as speech end. New chunks cancel the timer at their
-            // arrival site (modelTurn handler) so it never fires mid-turn.
+            // Nothing queued. If the turn is over, arm the echo-tail grace period
+            // so the mic re-opens AFTER the device speaker's tail has decayed.
             if (streamingTurnEndedRef.current) {
-                finishAiTurnSpeech('turnComplete+drained');
-            } else if (!audioIdleTimerRef.current) {
-                audioIdleTimerRef.current = setTimeout(() => {
-                    audioIdleTimerRef.current = null;
-                    // Re-check at fire time — a chunk could have arrived and
-                    // started playing in the gap between scheduling and firing.
-                    if (streamingPendingRef.current.length === 0
-                        && !streamingBusyRef.current
-                        && !aiResponseInterruptedRef.current) {
-                        finishAiTurnSpeech('audio-idle');
-                    }
-                }, AUDIO_IDLE_END_MS);
+                streamingTurnEndedRef.current = false;
+                // Flip the visualizer back to 'listen' IMMEDIATELY so the orb
+                // starts collapsing the moment audio actually ends. The mic
+                // echo-tail gate (isSpeaking.current) is a separate concern —
+                // it stays armed for 600 ms so the device-speaker tail and room
+                // reverb don't trip server VAD back to the user. Coupling both
+                // to the same timeout was the ~2-second "visualizer still
+                // bouncing after AI stopped" lag.
+                aiAmplitudeShared.value = 0;
+                setIsAiSpeaking(false);
+                if (echoTailTimerRef.current) clearTimeout(echoTailTimerRef.current);
+                echoTailTimerRef.current = setTimeout(() => {
+                    echoTailTimerRef.current = null;
+                    console.log('Streaming echo-tail elapsed — resuming mic');
+                    isSpeaking.current = false;
+                }, 600);
             }
             return;
         }
