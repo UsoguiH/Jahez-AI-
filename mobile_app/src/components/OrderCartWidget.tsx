@@ -1,5 +1,5 @@
 import React, { useEffect, useRef } from 'react';
-import { View, Text, TouchableOpacity, Animated, ScrollView, Image } from 'react-native';
+import { View, Text, TouchableOpacity, Animated, ScrollView, Image, StyleSheet, Dimensions } from 'react-native';
 import { MaterialIcons, Ionicons } from '@expo/vector-icons';
 import { getRestaurantLogo } from '../lib/restaurantLogos';
 
@@ -9,6 +9,12 @@ export interface CartItem {
     quantity: number;
     unit_price: number;
     notes?: string;
+    // Combo lines are added via add_active_combo_to_cart with custom modifications
+    // baked into name + unit_price. They must NOT be revalidated against the base
+    // menu (that would snap the price back to the un-modified combo price) and
+    // are tracked separately from regular cart items in update_cart.
+    is_combo?: boolean;
+    combo_id?: string;
 }
 
 interface OrderCartWidgetProps {
@@ -17,6 +23,7 @@ interface OrderCartWidgetProps {
     onConfirm: () => void;
     onEdit: () => void;
     onItemsChange?: (items: CartItem[]) => void;
+    onClose?: () => void;
 }
 
 const VAT_RATE = 0.15;
@@ -47,8 +54,10 @@ const getFoodImage = (nameEn: string): string => {
     return 'https://images.unsplash.com/photo-1546069901-ba9599a7e63c?auto=format&fit=crop&w=140&h=140&q=80';
 };
 
-const OrderCartWidget: React.FC<OrderCartWidgetProps> = ({ items, restaurantName, onConfirm, onEdit, onItemsChange }) => {
-    const slideAnim = useRef(new Animated.Value(100)).current;
+const { height: SCREEN_HEIGHT } = Dimensions.get('window');
+
+const OrderCartWidget: React.FC<OrderCartWidgetProps> = ({ items, restaurantName, onConfirm, onEdit, onItemsChange, onClose }) => {
+    const slideAnim = useRef(new Animated.Value(SCREEN_HEIGHT)).current;
     const fadeAnim = useRef(new Animated.Value(0)).current;
 
     useEffect(() => {
@@ -68,6 +77,23 @@ const OrderCartWidget: React.FC<OrderCartWidgetProps> = ({ items, restaurantName
             ]).start();
         }
     }, [items.length]);
+
+    const handleClose = () => {
+        Animated.parallel([
+            Animated.timing(slideAnim, {
+                toValue: SCREEN_HEIGHT,
+                duration: 350,
+                useNativeDriver: true,
+            }),
+            Animated.timing(fadeAnim, {
+                toValue: 0,
+                duration: 250,
+                useNativeDriver: true,
+            }),
+        ]).start(() => {
+            if (onClose) onClose();
+        });
+    };
 
     if (items.length === 0) return null;
 
@@ -94,59 +120,66 @@ const OrderCartWidget: React.FC<OrderCartWidgetProps> = ({ items, restaurantName
     };
 
     return (
-        <Animated.View
-            style={{
-                transform: [{ translateY: slideAnim }],
-                opacity: fadeAnim,
-                position: 'absolute',
-                bottom: 30,
-                left: 0,
-                right: 0,
-                zIndex: 50,
-            }}
-        >
-            <View style={{
-                backgroundColor: 'rgba(255, 255, 255, 0.97)',
-                borderTopLeftRadius: 24,
-                borderTopRightRadius: 24,
-                paddingHorizontal: 18,
-                paddingTop: 14,
-                paddingBottom: 40,
-                shadowColor: '#000',
-                shadowOffset: { width: 0, height: -4 },
-                shadowOpacity: 0.12,
-                shadowRadius: 12,
-                elevation: 20,
-                borderTopWidth: 0.5,
-                borderColor: 'rgba(0,0,0,0.06)',
-            }}>
+        <View style={{ position: 'absolute', top: -SCREEN_HEIGHT, bottom: 0, left: 0, right: 0, zIndex: 50, justifyContent: 'flex-end' }}>
+            {/* Dark Backdrop Overlay */}
+            <Animated.View style={[
+                StyleSheet.absoluteFillObject,
+                {
+                    backgroundColor: '#000',
+                    opacity: fadeAnim.interpolate({
+                        inputRange: [0, 1],
+                        outputRange: [0, 0.45]
+                    })
+                }
+            ]}>
+                <TouchableOpacity style={{ flex: 1 }} onPress={handleClose} activeOpacity={1} />
+            </Animated.View>
+
+            {/* Bottom Sheet */}
+            <Animated.View
+                style={{
+                    transform: [{ translateY: slideAnim }],
+                    backgroundColor: '#fff',
+                    borderTopLeftRadius: 36,
+                    borderTopRightRadius: 36,
+                    paddingHorizontal: 22,
+                    paddingTop: 14,
+                    paddingBottom: 40,
+                    shadowColor: '#000',
+                    shadowOffset: { width: 0, height: -4 },
+                    shadowOpacity: 0.1,
+                    shadowRadius: 16,
+                    elevation: 20,
+                }}
+            >
+                {/* Drag Slider Handle */}
+                <View style={{
+                    width: 44,
+                    height: 5,
+                    backgroundColor: '#D1D1D6',
+                    borderRadius: 3,
+                    alignSelf: 'center',
+                    marginBottom: 20
+                }} />
+
                 {/* Header */}
-                <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
-                    <TouchableOpacity onPress={onEdit} style={{ padding: 4 }}>
-                        <MaterialIcons name="edit" size={16} color="#86868B" />
+                <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 28 }}>
+                    {/* Left: Soft X Close Button */}
+                    <TouchableOpacity onPress={handleClose} activeOpacity={0.7} style={{ 
+                        width: 32, 
+                        height: 32, 
+                        borderRadius: 16, 
+                        backgroundColor: '#F2F2F7', 
+                        alignItems: 'center', 
+                        justifyContent: 'center' 
+                    }}>
+                        <Ionicons name="close" size={18} color="#1D1D1F" />
                     </TouchableOpacity>
-                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
-                        <Text style={{ fontSize: 16, fontWeight: '800', color: '#1D1D1F' }}>
-                            {restaurantName || 'طلبك'}
-                        </Text>
-                        {restaurantName && getRestaurantLogo(restaurantName) ? (
-                            <Image
-                                source={getRestaurantLogo(restaurantName)}
-                                style={{ width: 28, height: 28, borderRadius: 14, borderWidth: 1, borderColor: '#E5E5EA', backgroundColor: '#fff' }}
-                                resizeMode="contain"
-                            />
-                        ) : null}
-                        <View style={{
-                            backgroundColor: '#E31837',
-                            borderRadius: 10,
-                            paddingHorizontal: 7,
-                            paddingVertical: 2,
-                        }}>
-                            <Text style={{ color: 'white', fontSize: 11, fontWeight: '700' }}>
-                                {items.reduce((sum, i) => sum + i.quantity, 0)}
-                            </Text>
-                        </View>
-                    </View>
+
+                    {/* Right: Title */}
+                    <Text style={{ fontSize: 22, fontWeight: '800', color: '#1D1D1F' }}>
+                        تفاصيل الطلب
+                    </Text>
                 </View>
 
                 {/* Items */}
@@ -318,8 +351,8 @@ const OrderCartWidget: React.FC<OrderCartWidgetProps> = ({ items, restaurantName
                         <MaterialIcons name="edit" size={10} color="#86868B" />
                     </TouchableOpacity>
                 </View>
-            </View>
-        </Animated.View>
+            </Animated.View>
+        </View>
     );
 };
 

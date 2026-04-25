@@ -1,0 +1,335 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { X, Image as ImageIcon, Signal, Wifi, BatteryMedium } from 'lucide-react';
+
+/**
+ * Main Application Component
+ * * This component simulates a high-end AI voice interface with two modes:
+ * - Voice: A centered visualizer focused on audio interaction.
+ * - Vision: A scaled-down visualizer with an image background simulating a camera feed.
+ */
+export default function App() {
+  const [mode, setMode] = useState('voice');
+  const [state, setState] = useState('listen'); // States: listen, respond
+  const [gsapLoaded, setGsapLoaded] = useState(false);
+
+  const isVision = mode === 'vision';
+
+  // Load GSAP via CDN to handle complex motion sequences
+  useEffect(() => {
+    const script = document.createElement('script');
+    script.src = "https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.2/gsap.min.js";
+    script.onload = () => setGsapLoaded(true);
+    document.head.appendChild(script);
+  }, []);
+
+  return (
+    <div className="min-h-screen bg-[#F2F2F2] flex flex-col items-center justify-center p-4 font-sans text-black">
+      
+      {/* --- Debug/Control Panel --- */}
+      <div className="mb-8 flex flex-col items-center gap-4 bg-white/90 p-6 rounded-[2.5rem] shadow-xl backdrop-blur-xl border border-white">
+        <div className="flex bg-gray-200/50 rounded-full p-1 w-full max-w-xs">
+          {['voice', 'vision'].map((m) => (
+            <button
+              key={m}
+              onClick={() => setMode(m)}
+              className={`flex-1 py-2 rounded-full capitalize text-sm font-bold transition-all duration-300 ${
+                mode === m ? 'bg-black text-white shadow-lg' : 'text-gray-500 hover:text-black'
+              }`}
+            >
+              {m}
+            </button>
+          ))}
+        </div>
+        
+        <div className="flex flex-wrap justify-center gap-2">
+          {['listen', 'respond'].map((s) => (
+            <button
+              key={s}
+              onClick={() => setState(s)}
+              className={`px-4 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all duration-200 ${
+                state === s ? 'bg-black text-white' : 'bg-white text-gray-400 border border-gray-100 hover:text-gray-600 shadow-sm'
+              }`}
+            >
+              {s}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* --- iPhone Canvas --- */}
+      <div className="relative w-[340px] h-[720px] bg-white rounded-[4rem] border-[10px] border-[#121212] overflow-hidden shadow-[0_50px_100px_-20px_rgba(0,0,0,0.2)] flex flex-col">
+        <Styles />
+
+        {/* Vision Background (Mock Camera Feed) */}
+        <div className={`absolute inset-0 z-0 transition-opacity duration-1000 ${isVision ? 'opacity-100' : 'opacity-0'}`}>
+          {isVision && (
+            <img
+              src="https://images.unsplash.com/photo-1620121692029-d088224ddc74?auto=format&fit=crop&q=80&w=1000"
+              alt="Vision"
+              className="absolute inset-0 w-full h-full object-cover"
+            />
+          )}
+        </div>
+
+        {/* iOS Status Bar */}
+        <div className={`absolute top-0 w-full h-12 flex justify-between items-center px-8 pt-4 z-50 text-[13px] font-bold ${isVision ? 'text-white' : 'text-black'}`}>
+          <span>9:41</span>
+          <div className="flex items-center gap-1.5"><Signal size={14} /><Wifi size={14} /><BatteryMedium size={16} /></div>
+        </div>
+
+        {/* Dynamic Island Notch */}
+        <div className="absolute top-2.5 left-1/2 -translate-x-1/2 w-[110px] h-[34px] bg-black rounded-3xl z-50" />
+
+        {/* Canvas Visualizer Container */}
+        <div className={`relative z-10 flex flex-1 flex-col transition-all duration-700 ${isVision ? 'justify-start pt-20' : 'justify-center items-center'}`}>
+           <div className={`flex justify-center items-center w-full transition-transform duration-700 ${isVision ? 'scale-[0.4]' : 'scale-100'}`}>
+              {gsapLoaded && <CanvasVisualizer state={state} />}
+           </div>
+        </div>
+
+        {/* Controls Footer */}
+        <div className="relative z-20 w-full h-32 flex justify-between items-center px-10 pb-8">
+           <button className={`w-12 h-12 rounded-full flex items-center justify-center transition-all ${isVision ? 'bg-white/90 shadow-lg text-black' : 'bg-[#F2F0ED] text-gray-700'}`}>
+              <ImageIcon size={22} />
+           </button>
+           
+           <div className={`flex flex-col items-center justify-center h-16 transition-opacity duration-300`}>
+              {state === 'listen' ? (
+                <div className="flex flex-col items-center gap-1">
+                  <div className="flex gap-[3.5px]">
+                    {[0, 1, 2].map(i => <div key={i} className="w-[3px] h-3 bg-black rounded-full animate-pulse" style={{ animationDelay: `${i * 150}ms` }} />)}
+                  </div>
+                  <span className="text-[10px] font-black uppercase tracking-[0.2em] text-black/40">Listening</span>
+                </div>
+              ) : (
+                <span className="text-2xl tracking-[0.3em] font-light text-gray-300 select-none pb-4">••••</span>
+              )}
+           </div>
+
+           <button className={`w-12 h-12 rounded-full flex items-center justify-center transition-all ${isVision ? 'bg-white/90 shadow-lg text-black' : 'bg-[#F2F0ED] text-gray-700'}`}>
+              <X size={24} />
+           </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * CanvasVisualizer Component
+ * * Uses HTML5 Canvas and GSAP to render the morphing shapes.
+ * Transforms between a circle (active/listen) and precise Figma-defined bars (responding).
+ */
+const CanvasVisualizer = ({ state }) => {
+  const canvasRef = useRef(null);
+  
+  // Base measurements from Figma (Frame 3: width 61px, gap 3px)
+  const BAR_WIDTH = 61;
+  const BAR_BASE_HEIGHTS = [95, 138, 138, 95];
+
+  // Keep animation data in a ref to avoid React render cycles for high-frequency updates
+  const visualizerData = useRef({
+    circle: { width: 0, height: 0, opacity: 0, borderRadius: 0, scale: 1 },
+    ripples: [
+      { scale: 1, opacity: 0 },
+      { scale: 1, opacity: 0 }
+    ],
+    bars: [
+      { x: 0, height: 0, opacity: 0, width: BAR_WIDTH },
+      { x: 0, height: 0, opacity: 0, width: BAR_WIDTH },
+      { x: 0, height: 0, opacity: 0, width: BAR_WIDTH },
+      { x: 0, height: 0, opacity: 0, width: BAR_WIDTH },
+    ]
+  });
+
+  const activeTimeline = useRef(null);
+
+  useEffect(() => {
+    if (!window.gsap) return;
+    const gsap = window.gsap;
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext('2d');
+    const data = visualizerData.current;
+
+    // Centers calculated precisely from Figma width (61) and gap (3)
+    const X_TARGETS = [-96, -32, 32, 96]; 
+
+    // Cleanup previous animations
+    if (activeTimeline.current) activeTimeline.current.kill();
+    gsap.killTweensOf(data.circle);
+    data.bars.forEach(bar => gsap.killTweensOf(bar));
+    data.ripples.forEach(ripple => gsap.killTweensOf(ripple));
+
+    const tl = gsap.timeline();
+    activeTimeline.current = tl;
+
+    // --- Render Loop ---
+    const render = () => {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      const cx = canvas.width / 2;
+      const cy = canvas.height / 2;
+
+      // Draw Ripples (Listen State background)
+      data.ripples.forEach(ripple => {
+        if (ripple.opacity > 0) {
+          ctx.globalAlpha = ripple.opacity;
+          ctx.fillStyle = 'rgba(0,0,0,0.1)';
+          ctx.beginPath();
+          ctx.arc(cx, cy, (140 / 2) * ripple.scale, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      });
+
+      // Draw Circle/Blob (Listen State)
+      if (data.circle.opacity > 0) {
+        ctx.globalAlpha = data.circle.opacity;
+        ctx.fillStyle = 'black';
+        ctx.beginPath();
+        const w = data.circle.width * data.circle.scale;
+        const h = data.circle.height * data.circle.scale;
+        const r = data.circle.borderRadius * data.circle.scale;
+        ctx.roundRect(cx - w / 2, cy - h / 2, w, h, r);
+        ctx.fill();
+      }
+
+      // Draw Bars (Respond State)
+      data.bars.forEach((bar) => {
+        if (bar.opacity > 0) {
+          ctx.globalAlpha = bar.opacity;
+          ctx.fillStyle = 'black';
+          ctx.beginPath();
+          ctx.roundRect(cx + bar.x - bar.width / 2, cy - bar.height / 2, bar.width, bar.height, bar.width / 2);
+          ctx.fill();
+        }
+      });
+
+      requestAnimationFrame(render);
+    };
+    const animId = requestAnimationFrame(render);
+
+    // --- Animation Logic Sub-functions ---
+    
+    // Dynamic Audio-Reactive Equalizer for "responding" state
+    const animateBar = (bar, index) => {
+      // Create dynamic heights based on the Figma max heights to simulate human speech patterns
+      const maxH = BAR_BASE_HEIGHTS[index];
+      const minH = maxH * 0.25; // Don't let bars disappear completely
+      
+      // Random target height to mimic varied speech volume (syllables)
+      const targetHeight = minH + Math.random() * (maxH * 1.1 - minH);
+      
+      // Randomize animation speed to mimic natural speech cadence (fast and slow segments)
+      const duration = 0.12 + Math.random() * 0.18;
+
+      gsap.to(bar, {
+        height: targetHeight,
+        duration: duration,
+        ease: "sine.inOut",
+        onComplete: () => animateBar(bar, index)
+      });
+    };
+
+    const startEqualizer = () => {
+      data.bars.forEach((bar, i) => {
+        animateBar(bar, i);
+      });
+    };
+
+    // Pulsing and sonar effects for "listening" state
+    const startListeningFeedback = () => {
+      // 1. Sonar Ripples
+      data.ripples.forEach((ripple, i) => {
+        gsap.fromTo(ripple, 
+          { scale: 1, opacity: 0.2 },
+          { 
+            scale: 2.2, 
+            opacity: 0, 
+            duration: 2, 
+            repeat: -1, 
+            ease: "power2.out",
+            delay: i * 1.0 
+          }
+        );
+      });
+
+      // 2. Audio-reactive Jitter
+      const jitter = () => {
+        if (state !== 'listen') return;
+        gsap.to(data.circle, {
+          scale: 1 + Math.random() * 0.12,
+          duration: 0.1 + Math.random() * 0.1,
+          ease: "sine.inOut",
+          onComplete: jitter
+        });
+      };
+      jitter();
+    };
+
+    // --- State Transitions ---
+    if (state === 'listen') {
+      // If transition from Bars back to Circle
+      if (data.bars[0].opacity > 0) {
+        tl.to(data.bars, {
+          x: 0, height: 138, duration: 0.35, ease: "expo.inOut",
+          stagger: { amount: 0.08, from: "edges" }
+        })
+        .set(data.bars, { opacity: 0 })
+        .set(data.circle, { opacity: 1, width: BAR_WIDTH, height: 138, borderRadius: BAR_WIDTH / 2, scale: 1 })
+        .to(data.circle, {
+          width: 140, height: 140, borderRadius: 70, duration: 0.5, ease: "back.out(1.5)",
+          onComplete: startListeningFeedback
+        });
+      } else {
+        // Initial entry
+        tl.to(data.circle, { 
+          opacity: 1, width: 140, height: 140, borderRadius: 70, scale: 1, duration: 0.4, ease: "power4.out",
+          onComplete: startListeningFeedback
+        });
+      }
+    } 
+    else if (state === 'respond') {
+      gsap.to(data.ripples, { opacity: 0, duration: 0.2 });
+      tl.to(data.circle, {
+        width: 170, height: 80, borderRadius: 40, duration: 0.18, ease: "expo.inOut", scale: 1
+      })
+      .to(data.circle, {
+        width: BAR_WIDTH, height: 138, borderRadius: BAR_WIDTH / 2, duration: 0.15, ease: "expo.in"
+      })
+      .add(() => {
+        data.circle.opacity = 0;
+        data.bars.forEach((bar) => { bar.opacity = 1; bar.x = 0; bar.height = 138; });
+      })
+      .to(data.bars, {
+        x: (i) => X_TARGETS[i],
+        height: (i) => BAR_BASE_HEIGHTS[i],
+        duration: 0.45,
+        ease: "back.out(1.8)",
+        stagger: 0.03,
+        onComplete: startEqualizer
+      });
+    }
+
+    return () => cancelAnimationFrame(animId);
+  }, [state]);
+
+  return (
+    <canvas
+      ref={canvasRef}
+      width={400}
+      height={400}
+      className="w-[300px] h-[300px]"
+    />
+  );
+}
+
+const Styles = () => (
+  <style>{`
+    @keyframes spin { 100% { transform: rotate(360deg); } }
+    @keyframes pulse { 0% { opacity: 0.6; } 100% { opacity: 1; } }
+    
+    body {
+      background-color: #F2F2F2;
+      overflow: hidden;
+    }
+  `}</style>
+);
