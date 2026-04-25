@@ -44,6 +44,41 @@ import { appendWavHeader, computeAmplitudeEnvelope, computePeakEnvelopeFast } fr
 if (!global.btoa) { global.btoa = btoa; }
 if (!global.atob) { global.atob = atob; }
 
+// Each AI audio chunk gets written to FileSystem.cacheDirectory as a WAV
+// (`stream_*.wav` / `response_*.wav`) before Audio.Sound.createAsync loads it.
+// Files in cacheDirectory survive app restart, and we only delete the ones
+// whose unload path completed cleanly — interrupts, force-quits, and crashes
+// leave orphans behind. After a few sessions the cache fills with hundreds of
+// stale WAVs, and FileSystem.writeAsStringAsync slows down on a bloated dir,
+// which is why the SECOND launch of the app feels sluggish (animations lag,
+// cart appears late) while the FIRST launch is fast. Sweep on overlay open.
+//
+// Timestamp filter: filenames embed Date.now(), so we only delete files older
+// than the cutoff. Protects writes from the currently-running session if the
+// sweep ever races against an in-flight chunk write.
+const sweepStaleAudioCache = async () => {
+    try {
+        const dir = FileSystem.cacheDirectory || FileSystem.documentDirectory;
+        if (!dir) return;
+        const entries = await FileSystem.readDirectoryAsync(dir);
+        const cutoff = Date.now() - 30_000;
+        const stale: string[] = [];
+        for (const name of entries) {
+            if (!name.endsWith('.wav')) continue;
+            if (!name.startsWith('stream_') && !name.startsWith('response_')) continue;
+            const m = name.match(/_(\d{10,})/);
+            if (m && parseInt(m[1], 10) < cutoff) stale.push(name);
+        }
+        if (stale.length === 0) return;
+        await Promise.all(
+            stale.map(name => FileSystem.deleteAsync(dir + name, { idempotent: true }).catch(() => {}))
+        );
+        console.log(`[AUDIO] swept ${stale.length} stale WAV files`);
+    } catch {
+        // Best-effort; never block startup on cleanup failure.
+    }
+};
+
 interface Restaurant {
     id: string;
     name_ar: string;
@@ -113,6 +148,11 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
     const recording = useRef<Audio.Recording | null>(null);
     const audioBuffer = useRef<string>('');
     const currentSound = useRef<Audio.Sound | null>(null);
+    // Mirror of currentSound holding the on-disk WAV path so we can delete it
+    // after unload — kept in lockstep with currentSound (set when assigned,
+    // cleared when unloaded). External interrupt paths (mic-tap, server cancel,
+    // turn-end) can recover the URI without threading it through every call.
+    const currentSoundUriRef = useRef<string | null>(null);
     const isSpeaking = useRef<boolean>(false);
     // Interrupt tracking — capture AI response item_id + live playback position so we can
     // truncate the assistant's turn at the exact ms the user stopped listening.
@@ -274,6 +314,10 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
             setStatus('Idle');
             setTranscript('');
             preloadMenus();
+            // Fire-and-forget: clear leftover WAVs from prior sessions before
+            // streaming starts. Background-runs concurrently with the connect
+            // sequence so it never delays first paint or first audio.
+            sweepStaleAudioCache();
             // Start ChatGPT-style connecting sequence
             runConnectingSequence();
         } else {
@@ -783,11 +827,16 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
         // Detach the sound's status callback BEFORE stopping, so a final status update
         // can't flip isAiSpeaking back on or write to aiAmplitudeShared after we reset.
         const sound = currentSound.current;
+        const soundUri = currentSoundUriRef.current;
         if (sound) {
             try { sound.setOnPlaybackStatusUpdate(null); } catch {}
             try { await sound.stopAsync(); } catch {}
             try { await sound.unloadAsync(); } catch {}
-            if (currentSound.current === sound) currentSound.current = null;
+            if (currentSound.current === sound) {
+                currentSound.current = null;
+                currentSoundUriRef.current = null;
+            }
+            if (soundUri) FileSystem.deleteAsync(soundUri, { idempotent: true }).catch(() => {});
         }
         aiAmplitudeShared.value = 0;
 
@@ -1774,11 +1823,16 @@ ${combosCatalogForPrompt()}
                             streamingBusyRef.current = false;
                             firstKickPendingRef.current = false;
                             const sound = currentSound.current;
+                            const soundUri = currentSoundUriRef.current;
                             if (sound) {
                                 try { sound.setOnPlaybackStatusUpdate(null); } catch {}
                                 try { await sound.stopAsync(); } catch {}
                                 try { await sound.unloadAsync(); } catch {}
-                                if (currentSound.current === sound) currentSound.current = null;
+                                if (currentSound.current === sound) {
+                                    currentSound.current = null;
+                                    currentSoundUriRef.current = null;
+                                }
+                                if (soundUri) FileSystem.deleteAsync(soundUri, { idempotent: true }).catch(() => {});
                             }
                             visualizerRef.current?.forceListen();
                             isSpeaking.current = false;
@@ -2456,14 +2510,19 @@ ${combosCatalogForPrompt()}
         // stop/unload runs in the background. Awaiting those here added
         // ~100-150ms between batches on weak phones — audible as a lag.
         const prevSound = currentSound.current;
+        const prevUri = currentSoundUriRef.current;
         if (prevSound) {
             currentSound.current = null;
+            currentSoundUriRef.current = null;
             try { prevSound.setOnPlaybackStatusUpdate(null); } catch {}
             // Fire-and-forget teardown. stopAsync is called before the new
             // sound's playAsync resolves, so there's no audible overlap.
+            // Delete the WAV after unload — without this, mid-chunk replacement
+            // leaks one file per chunk on long AI turns.
             (async () => {
                 try { await prevSound.stopAsync(); } catch {}
                 try { await prevSound.unloadAsync(); } catch {}
+                if (prevUri) FileSystem.deleteAsync(prevUri, { idempotent: true }).catch(() => {});
             })();
         }
 
@@ -2477,10 +2536,12 @@ ${combosCatalogForPrompt()}
         // still giving real amplitude-driven bars during the chunk.
         let envelope: number[] = [];
         const envelopeFps = 30;
+        // Hoisted so the catch block (and any cleanup path) can delete the WAV
+        // even when failure happens after the file was written.
+        const uri = (FileSystem.cacheDirectory || FileSystem.documentDirectory || '')
+            + `stream_${Date.now()}_${Math.random().toString(36).slice(2, 7)}.wav`;
         try {
             const wavData = appendWavHeader(batch);
-            const uri = (FileSystem.cacheDirectory || FileSystem.documentDirectory || '')
-                + `stream_${Date.now()}_${Math.random().toString(36).slice(2, 7)}.wav`;
             await FileSystem.writeAsStringAsync(uri, wavData, { encoding: FileSystem.EncodingType.Base64 });
             if (aiResponseInterruptedRef.current) { streamingBusyRef.current = false; return; }
 
@@ -2494,11 +2555,13 @@ ${combosCatalogForPrompt()}
             newSound = created.sound;
             if (aiResponseInterruptedRef.current) {
                 try { await newSound.unloadAsync(); } catch {}
+                FileSystem.deleteAsync(uri, { idempotent: true }).catch(() => {});
                 newSound = null;
                 streamingBusyRef.current = false;
                 return;
             }
             currentSound.current = newSound;
+            currentSoundUriRef.current = uri;
             await newSound.playAsync();
 
             // Envelope computation, deferred to AFTER playAsync resolves. This
@@ -2532,7 +2595,11 @@ ${combosCatalogForPrompt()}
                         aiAmplitudeShared.value = 0;
                         playbackPositionMsRef.current = 0;
                         try { newSound!.unloadAsync(); } catch {}
-                        if (currentSound.current === newSound) currentSound.current = null;
+                        FileSystem.deleteAsync(uri, { idempotent: true }).catch(() => {});
+                        if (currentSound.current === newSound) {
+                            currentSound.current = null;
+                            currentSoundUriRef.current = null;
+                        }
                         streamingBusyRef.current = false;
                         // Whatever accumulated during this chunk's playback is now
                         // ready to play — keep the pipe full to minimize gap.
@@ -2548,11 +2615,16 @@ ${combosCatalogForPrompt()}
             if (newSound) {
                 const failed = newSound;
                 newSound = null;
-                if (currentSound.current === failed) currentSound.current = null;
+                if (currentSound.current === failed) {
+                    currentSound.current = null;
+                    currentSoundUriRef.current = null;
+                }
                 try { failed.setOnPlaybackStatusUpdate(null); } catch {}
                 try { await failed.stopAsync(); } catch {}
                 try { await failed.unloadAsync(); } catch {}
             }
+            // The WAV may have been written before the failure — delete unconditionally.
+            FileSystem.deleteAsync(uri, { idempotent: true }).catch(() => {});
             streamingBusyRef.current = false;
             // Defer the drain retry. A synchronous retry after AudioFocus
             // failure just fails the same way and risks stacking playbacks
@@ -2570,11 +2642,14 @@ ${combosCatalogForPrompt()}
         if (aiResponseInterruptedRef.current) return;
         try {
             if (currentSound.current) {
+                const prevUri = currentSoundUriRef.current;
                 try {
                     await currentSound.current.stopAsync();
                     await currentSound.current.unloadAsync();
                 } catch (e) { /* ignore */ }
                 currentSound.current = null;
+                currentSoundUriRef.current = null;
+                if (prevUri) FileSystem.deleteAsync(prevUri, { idempotent: true }).catch(() => {});
             }
             if (aiResponseInterruptedRef.current) return;
 
@@ -2588,7 +2663,10 @@ ${combosCatalogForPrompt()}
             const wavData = appendWavHeader(pcmBase64);
             const uri = (FileSystem.cacheDirectory || FileSystem.documentDirectory || '') + `response_${Date.now()}.wav`;
             await FileSystem.writeAsStringAsync(uri, wavData, { encoding: FileSystem.EncodingType.Base64 });
-            if (aiResponseInterruptedRef.current) return;
+            if (aiResponseInterruptedRef.current) {
+                FileSystem.deleteAsync(uri, { idempotent: true }).catch(() => {});
+                return;
+            }
 
             const { sound: newSound } = await Audio.Sound.createAsync(
                 { uri },
@@ -2598,9 +2676,11 @@ ${combosCatalogForPrompt()}
             // instead of starting playback.
             if (aiResponseInterruptedRef.current) {
                 try { await newSound.unloadAsync(); } catch {}
+                FileSystem.deleteAsync(uri, { idempotent: true }).catch(() => {});
                 return;
             }
             currentSound.current = newSound;
+            currentSoundUriRef.current = uri;
             await newSound.playAsync();
             newSound.setOnPlaybackStatusUpdate(status => {
                 // Guard every status update — once interrupted, the sound is being
@@ -2617,7 +2697,11 @@ ${combosCatalogForPrompt()}
                         playbackPositionMsRef.current = 0;
                         currentResponseItemIdRef.current = null;
                         newSound.unloadAsync();
-                        if (currentSound.current === newSound) currentSound.current = null;
+                        FileSystem.deleteAsync(uri, { idempotent: true }).catch(() => {});
+                        if (currentSound.current === newSound) {
+                            currentSound.current = null;
+                            currentSoundUriRef.current = null;
+                        }
                         // Grace period: the device speaker's tail + room reverb still
                         // hit the mic for a few hundred ms after didJustFinish. Keep
                         // isSpeaking true during that window so the mic handler drops
@@ -2758,11 +2842,14 @@ ${combosCatalogForPrompt()}
             console.log('[TAP-INTERRUPT] User tapped mic — stopping AI playback');
             audioBuffer.current = '';
             if (currentSound.current) {
+                const tapUri = currentSoundUriRef.current;
                 try {
                     await currentSound.current.stopAsync();
                     await currentSound.current.unloadAsync();
                 } catch (e) { /* ignore */ }
                 currentSound.current = null;
+                currentSoundUriRef.current = null;
+                if (tapUri) FileSystem.deleteAsync(tapUri, { idempotent: true }).catch(() => {});
             }
             isSpeaking.current = false;
             setIsAiSpeaking(false);
