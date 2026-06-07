@@ -146,8 +146,10 @@ const HomeScreen = ({ userId }: { userId?: string }) => {
                         { name: 'كنتاكي', rating: '4.0', image: 'https://images.unsplash.com/photo-1513639776629-7b611594e29b?w=500', time: '25-40 دقيقة', delivery: '10 ريال', tags: 'دجاج مقلي • أمريكي' },
                     ].map((item, index) => (
                         <TouchableOpacity key={index} className="bg-white rounded-2xl shadow-sm mb-5 overflow-hidden border border-gray-100">
-                            <View className="h-40 bg-gray-200 relative">
-                                <Image source={{ uri: item.image }} className="w-full h-full" resizeMode="cover" />
+                            <View style={{ height: 160 }} className="bg-gray-200 relative items-center justify-center">
+                                {/* Fallback icon sits behind the photo; visible only if the image fails to load */}
+                                <Ionicons name="restaurant" size={44} color="#cbd5e1" style={{ position: 'absolute' }} />
+                                <Image source={{ uri: item.image }} style={{ width: '100%', height: '100%' }} resizeMode="cover" />
                                 <View className="absolute top-3 right-3 bg-white px-2 py-1 rounded-lg flex-row items-center shadow-sm">
                                     <Text className="text-xs font-bold mr-1">{item.time}</Text>
                                     <Ionicons name="time-outline" size={12} color="black" />
