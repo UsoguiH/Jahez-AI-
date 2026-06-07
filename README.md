@@ -20,19 +20,14 @@ places the order — hands-free, end to end.
 
 ## Demo
 
-> 🎬 **Demo video coming soon.**
-
-<!--
-  Replace this block with the demo.
-  Option A — embed an uploaded clip: drag the .mp4 into this file on GitHub and it
-  becomes a player automatically.
-  Option B — link a thumbnail to YouTube:
-
-  [![Watch the demo](docs/demo-thumbnail.png)](https://youtu.be/your-video-id)
--->
-
 <div align="center">
-  <em>A 60-second walkthrough: speak an order in Arabic → watch the cart build itself → confirm.</em>
+
+https://github.com/UsoguiH/Jahez-AI-/raw/jahez-3.1-test/docs/demo.mp4
+
+<sub>▶ If the player doesn't load, <a href="docs/demo.mp4">watch <code>docs/demo.mp4</code></a>.</sub>
+
+<em>Speak an order in Arabic → watch the cart build itself → confirm.</em>
+
 </div>
 
 ---
