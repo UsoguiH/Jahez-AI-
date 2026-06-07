@@ -22,9 +22,9 @@ places the order — hands-free, end to end.
 
 <div align="center">
 
-https://github.com/UsoguiH/Jahez-AI-/raw/jahez-3.1-test/docs/demo.mp4
-
-<sub>▶ If the player doesn't load, <a href="docs/demo.mp4">watch <code>docs/demo.mp4</code></a>.</sub>
+<a href="https://github.com/UsoguiH/Jahez-AI-/raw/jahez-3.1-test/docs/demo.mp4">
+  <img src="docs/demo-thumb.jpg" alt="▶ Watch the demo" width="720">
+</a>
 
 <em>Speak an order in Arabic → watch the cart build itself → confirm.</em>
 
