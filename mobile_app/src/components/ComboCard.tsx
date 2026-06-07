@@ -725,13 +725,9 @@ const Chip: React.FC<{
 
     useEffect(() => {
         if (isSelected) {
-            // JS driver — same Animated.View also drives backgroundColor + borderColor
-            // via heardGlow (JS-only color interpolations). Mixing drivers on one node
-            // throws "JS driven animation on animated node moved to native earlier"
-            // when isSelected and isHeard fire close together.
             Animated.sequence([
-                Animated.timing(scale, { toValue: 1.05, duration: 120, useNativeDriver: false }),
-                Animated.spring(scale, { toValue: 1, friction: 6, useNativeDriver: false }),
+                Animated.timing(scale, { toValue: 1.05, duration: 120, useNativeDriver: true }),
+                Animated.spring(scale, { toValue: 1, friction: 6, useNativeDriver: true }),
             ]).start();
         }
     }, [isSelected]);

@@ -45,35 +45,6 @@ export const CUISINE_MAP: Record<string, string[]> = {
     'مندي': ['الرومانسية'],
 };
 
-// Client-side fast-path — used by VoiceOverlay to detect cuisine intent
-// from live ASR partials and call handleSuggestRestaurants BEFORE the
-// model's tool call lands. Each entry maps the canonical CUISINE_MAP key
-// to common Arabic spellings/colloquial variants the user might say.
-// Match is a simple substring scan: cheap enough to run on every partial
-// delta without affecting transcription latency.
-const FAST_CUISINE_PATTERNS: Array<{ key: string; patterns: string[] }> = [
-    { key: 'برجر', patterns: ['برجر', 'برغر', 'همبرجر', 'همبرغر'] },
-    { key: 'بيتزا', patterns: ['بيتزا', 'بيزا'] },
-    { key: 'دجاج', patterns: ['دجاج', 'فروج', 'بروست'] },
-    { key: 'شاورما', patterns: ['شاورما', 'شاورم', 'شارمه'] },
-    { key: 'قهوة', patterns: ['قهوه', 'قهوة', 'كوفي', 'كافيه'] },
-    { key: 'حلا', patterns: ['حلى', 'حلوى', 'آيس كريم', 'ايس كريم'] },
-    { key: 'ساندوتش', patterns: ['ساندوتش', 'سندوتش', 'ساندويش', 'ساندويتش'] },
-    { key: 'كبسة', patterns: ['كبسة', 'كابسة'] },
-    { key: 'مندي', patterns: ['مندي'] },
-];
-
-export const detectCuisineIntent = (transcript: string): string | null => {
-    if (!transcript) return null;
-    const t = transcript.toLowerCase();
-    for (const entry of FAST_CUISINE_PATTERNS) {
-        for (const p of entry.patterns) {
-            if (t.includes(p)) return entry.key;
-        }
-    }
-    return null;
-};
-
 // ─── Individual Card ────────────────────────────────────────────
 const AnimatedCard: React.FC<{
     restaurant: RestaurantSuggestion;
@@ -107,7 +78,7 @@ const AnimatedCard: React.FC<{
     const dismissScale = useRef(new Animated.Value(1)).current;
     const dismissSlide = useRef(new Animated.Value(0)).current;
 
-    // Entrance: staggered card landing followed by a logo pop on each card.
+    // Entrance
     useEffect(() => {
         const delay = index * 120;
         setTimeout(() => {
@@ -116,7 +87,10 @@ const AnimatedCard: React.FC<{
                 Animated.spring(cardSlide, { toValue: 0, tension: 50, friction: 8, useNativeDriver: true }),
                 Animated.spring(cardScale, { toValue: 1, tension: 60, friction: 7, useNativeDriver: true }),
             ]).start(() => {
-                Animated.spring(logoScale, { toValue: 1, tension: 120, friction: 6, useNativeDriver: true }).start();
+                Animated.sequence([
+                    Animated.delay(80),
+                    Animated.spring(logoScale, { toValue: 1, tension: 120, friction: 6, useNativeDriver: true }),
+                ]).start();
             });
         }, delay);
     }, []);
@@ -331,11 +305,10 @@ const RestaurantSuggestions: React.FC<RestaurantSuggestionsProps> = ({ restauran
 
     const handleCardSelect = (name: string) => {
         setSelectedName(name);
-        // Fire onSelect immediately — parent runs the local select flow on the
-        // same frame so the top-right logo spring kicks in <500 ms. The parent
-        // defers unmounting these cards by 700 ms so the celebration (glow +
-        // check pop + ring) plays through before they disappear.
-        onSelect(name);
+        // Wait for the selection animation to play, then call parent onSelect
+        setTimeout(() => {
+            onSelect(name);
+        }, 900);
     };
 
     if (restaurants.length === 0) return null;

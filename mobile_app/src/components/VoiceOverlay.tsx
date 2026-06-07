@@ -13,7 +13,7 @@ import CheckoutScreen from './CheckoutScreen';
 import AIVisualizer, { AIVisualizerHandle } from './AIVisualizer';
 import InlineCartWidget from './InlineCartWidget';
 import OrderConfirmation from './OrderConfirmation';
-import RestaurantSuggestions, { CUISINE_MAP, detectCuisineIntent } from './RestaurantSuggestions';
+import RestaurantSuggestions, { CUISINE_MAP } from './RestaurantSuggestions';
 import { getRestaurantLogo } from '../lib/restaurantLogos';
 import { comboStore, useActiveCombo } from '../state/comboStore';
 import { ComboItem } from '../data/mcdonaldsCombo';
@@ -37,7 +37,7 @@ import {
 } from '../lib/transcribeSession';
 // Hoisted from inside playAudioChunk — the dynamic import on first call was
 // costing ~50-100ms every time the AI started talking.
-import { appendWavHeader, appendWavHeaderFromChunks } from '../lib/audioUtils';
+import { appendWavHeader } from '../lib/audioUtils';
 
 // Polyfill for global
 if (!global.btoa) { global.btoa = btoa; }
@@ -160,11 +160,6 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
     // messages and pending playAudioChunk calls from restarting playback after interrupt.
     // Reset on the next response.created so the NEXT assistant turn plays normally.
     const aiResponseInterruptedRef = useRef<boolean>(false);
-    // Set true once detectCuisineIntent fires handleSuggestRestaurants for the
-    // current user turn, so we don't re-fire on every subsequent partial delta
-    // (and don't double-fire when the AI's suggest_restaurants tool call lands).
-    // Cleared on turnComplete and on user interrupt.
-    const fastSuggestFiredRef = useRef<boolean>(false);
     // Imperative handle to the visualizer so interrupt can snap it to the orb instantly.
     const visualizerRef = useRef<AIVisualizerHandle | null>(null);
 
@@ -185,19 +180,10 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
     // --- Gemini streaming playback state ---
     // Instead of buffering the entire AI turn before playing (which makes the user
     // wait ~3-4s from "transcription appears" to "voice starts"), we play chunks as
-    // they arrive. inlineData base64 chunks accumulate in streamingPendingRef until
-    // we hit the first-batch threshold, then we start playing. Subsequent audio
-    // arriving during playback is drained and played when the current chunk ends.
-    //
-    // streamingPendingRef holds an ARRAY of the original base64 chunks (not a
-    // concatenated string). Gemini 3.1 emits many small chunks per turn whose
-    // byte counts are rarely mod-3 aligned, so each chunk usually ends with `=`
-    // padding. Naive string concat produces invalid base64 like "AB=CD" that
-    // atob() rejects, killing the whole batch — audible as stutter/silence.
-    // Decoding each chunk individually (in appendWavHeaderFromChunks) sidesteps
-    // the alignment problem since the server's individual chunks are well-formed.
-    const streamingPendingRef = useRef<string[]>([]);          // unplayed base64 PCM chunks
-    const streamingPendingBytesRef = useRef<number>(0);        // total base64 chars buffered (cheap threshold check)
+    // they arrive. inlineData base64 accumulates in streamingPendingRef until we hit
+    // the first-batch threshold, then we start playing. Subsequent audio that arrives
+    // during playback is drained and played immediately when the current chunk ends.
+    const streamingPendingRef = useRef<string>('');           // unplayed base64 PCM
     const streamingBusyRef = useRef<boolean>(false);           // a chunk is playing now
     const streamingTurnEndedRef = useRef<boolean>(false);      // turnComplete seen, no more chunks
     // Armed while the deferred first-kick setTimeout is pending, so repeated
@@ -205,17 +191,8 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
     // kick after the threshold is first crossed.
     const firstKickPendingRef = useRef<boolean>(false);
     // First batch threshold ≈ 400ms of 24kHz PCM16. Larger = smoother start/less
-    // under-run risk; smaller = snappier first-audio latency.
+    // under-run risk; smaller = snappier first-audio latency. 400ms is our sweet spot.
     const STREAM_FIRST_BATCH_MIN_B64 = 12800;
-    // Subsequent-batch min ≈ 100ms. After the first batch is playing, each
-    // recursive drain spawns a fresh Audio.Sound (Android audio-focus setup
-    // ~30-60ms each). 3.1 emits microscopic chunks (1-10 token frames), so
-    // without a min-drain we churn through dozens of tiny Sounds per turn —
-    // the audible "robotic stutter". When the recursive playback finishes a
-    // batch and finds less than this much queued, wait briefly for more
-    // chunks instead of spawning a new Sound for ~30ms of audio.
-    // Bypass when streamingTurnEndedRef is true (turn over → drain everything).
-    const STREAM_SUBSEQUENT_MIN_B64 = 3200;
 
     // Restaurant menu data — pre-loaded on mic open for zero latency
     const restaurantsRef = useRef<Restaurant[]>([]);
@@ -579,12 +556,10 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
         const targetYs = [160, 255, 350];
         const pillW = Math.min(Dimensions.get('window').width - 80, 300);
 
-        // Each phase runs on its own driver to avoid bundling native and JS leaves
-        // into a single Animated.parallel — that pattern throws "JS driven animation
-        // on animated node moved to native earlier". setTimeout sequences the phases
-        // instead of Animated.sequence(Animated.delay(...), ...) so each .start() is
-        // single-driver from RN's point of view.
+        const animations: Animated.CompositeAnimation[] = [];
+
         dropScales.forEach((s, i) => {
+            // GSAP: set opacity 1, scale 0.5, then animate
             dropOpacities[i].setValue(1);
             dropScales[i].setValue(0.5);
 
@@ -592,27 +567,32 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
             const expandDelay = 500 + i * 120;
             const labelDelay = 800 + i * 120;
 
-            setTimeout(() => {
-                Animated.parallel([
-                    Animated.spring(dropYs[i], { toValue: targetYs[i], tension: 50, friction: 7, useNativeDriver: true }),
-                    Animated.spring(s, { toValue: 1, tension: 50, friction: 7, useNativeDriver: true }),
-                ]).start();
-            }, dropDelay);
-
-            setTimeout(() => {
-                Animated.parallel([
-                    Animated.timing(dropWidths[i], { toValue: pillW, duration: 500, easing: Easing.inOut(Easing.cubic), useNativeDriver: false }),
-                    Animated.timing(dropHeights[i], { toValue: 72, duration: 500, easing: Easing.inOut(Easing.cubic), useNativeDriver: false }),
-                ]).start();
-            }, expandDelay);
-
-            setTimeout(() => {
-                Animated.parallel([
-                    Animated.spring(labelOpacities[i], { toValue: 1, tension: 80, friction: 10, useNativeDriver: true }),
-                    Animated.spring(labelScales[i], { toValue: 1, tension: 80, friction: 10, useNativeDriver: true }),
-                ]).start();
-            }, labelDelay);
+            animations.push(
+                Animated.sequence([
+                    Animated.delay(dropDelay),
+                    Animated.parallel([
+                        Animated.spring(dropYs[i], { toValue: targetYs[i], tension: 50, friction: 7, useNativeDriver: true }),
+                        Animated.spring(s, { toValue: 1, tension: 50, friction: 7, useNativeDriver: true })
+                    ])
+                ]),
+                Animated.sequence([
+                    Animated.delay(expandDelay),
+                    Animated.parallel([
+                        Animated.timing(dropWidths[i], { toValue: pillW, duration: 500, easing: Easing.inOut(Easing.cubic), useNativeDriver: false }),
+                        Animated.timing(dropHeights[i], { toValue: 72, duration: 500, easing: Easing.inOut(Easing.cubic), useNativeDriver: false })
+                    ])
+                ]),
+                Animated.sequence([
+                    Animated.delay(labelDelay),
+                    Animated.parallel([
+                        Animated.spring(labelOpacities[i], { toValue: 1, tension: 80, friction: 10, useNativeDriver: true }),
+                        Animated.spring(labelScales[i], { toValue: 1, tension: 80, friction: 10, useNativeDriver: true })
+                    ])
+                ])
+            );
         });
+
+        Animated.parallel(animations).start();
     };
 
     // =====================================================
@@ -632,20 +612,18 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
         const easeInOut = Easing.bezier(0.4, 0, 0.2, 1); // Material "standard" curve — polished feel
 
         // --- PHASE 1 (0 → 200ms): non-selected pills fade out, all labels fade (label of selected first)
-        // All-native parallel — Animated.delay() entries would flag the parallel as
-        // mixed-driver and trigger the JS-vs-native conflict. Skip idx instead.
-        const phase1: Animated.CompositeAnimation[] = [];
-        dropOpacities.forEach((op, i) => {
-            if (i !== idx) phase1.push(Animated.timing(op, { toValue: 0, duration: 220, easing: easeOut, useNativeDriver: true }));
-        });
-        dropScales.forEach((sc, i) => {
-            if (i !== idx) phase1.push(Animated.timing(sc, { toValue: 0.3, duration: 220, easing: easeOut, useNativeDriver: true }));
-        });
-        labelOpacities.forEach((op) => {
-            phase1.push(Animated.timing(op, { toValue: 0, duration: 180, easing: easeOut, useNativeDriver: true }));
-        });
-        phase1.push(Animated.timing(statusOpacity, { toValue: 0, duration: 200, easing: easeOut, useNativeDriver: true }));
-        Animated.parallel(phase1).start();
+        Animated.parallel([
+            ...dropOpacities.map((op, i) =>
+                i === idx ? Animated.delay(0) : Animated.timing(op, { toValue: 0, duration: 220, easing: easeOut, useNativeDriver: true })
+            ),
+            ...dropScales.map((sc, i) =>
+                i === idx ? Animated.delay(0) : Animated.timing(sc, { toValue: 0.3, duration: 220, easing: easeOut, useNativeDriver: true })
+            ),
+            ...labelOpacities.map((op) =>
+                Animated.timing(op, { toValue: 0, duration: 180, easing: easeOut, useNativeDriver: true })
+            ),
+            Animated.timing(statusOpacity, { toValue: 0, duration: 200, easing: easeOut, useNativeDriver: true }),
+        ]).start();
 
         // --- PHASE 2 (140 → 460ms): selected pill MORPHS from capsule (~pillW × 72) to ball (60 × 60)
         // This is the "cool" part — smooth shape collapse. JS-thread driven (width/height), but isolated
@@ -656,32 +634,34 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
         ]).start();
 
         // --- PHASE 3 (440 → 820ms): the ball glides up toward the orb, orb anticipates ---
-        // Each .start() is single-driver. setTimeout sequences the orb-squish chain
-        // instead of Animated.sequence(Animated.delay, ...) inside a parallel — that
-        // mix triggers the JS-vs-native conflict.
-        Animated.timing(dropYs[idx], { toValue: 0, duration: 380, delay: 440, easing: easeInOut, useNativeDriver: true }).start();
-        setTimeout(() => {
+        Animated.parallel([
+            // Ball flies up into the orb's position
+            Animated.timing(dropYs[idx], { toValue: 0, duration: 380, delay: 440, easing: easeInOut, useNativeDriver: true }),
+            // Orb does a subtle squish-anticipation
             Animated.sequence([
+                Animated.delay(440),
                 Animated.timing(blobTransY, { toValue: 6, duration: 180, easing: easeInOut, useNativeDriver: true }),
                 Animated.timing(blobTransY, { toValue: 0, duration: 260, easing: easeOut, useNativeDriver: true }),
-            ]).start();
-        }, 440);
+            ]),
+        ]).start();
 
         // --- PHASE 4 (780 → 1180ms): absorb — ball fades into orb, orb pops, then lifts ---
-        // Each .start() is single-driver. setTimeout sequences the blob-pop chain
-        // rather than nesting Animated.sequence(Animated.delay, ...) inside a parallel.
-        Animated.timing(dropOpacities[idx], { toValue: 0, duration: 180, delay: 780, easing: easeOut, useNativeDriver: true }).start();
-        Animated.timing(dropScales[idx], { toValue: 0.85, duration: 180, delay: 780, easing: easeOut, useNativeDriver: true }).start();
-        // AIVisualizer's CIRCLE_SIZE is 98px = coreBlob 140px × 0.7, so ending blobScale
-        // at 0.7 means the handoff to the visualizer at chatReady is size-matched and the
-        // user sees a smooth shrink instead of a pop-to-smaller on unmount.
-        setTimeout(() => {
+        Animated.parallel([
+            // Ball fades in sync with the absorb pop
+            Animated.timing(dropOpacities[idx], { toValue: 0, duration: 180, delay: 780, easing: easeOut, useNativeDriver: true }),
+            Animated.timing(dropScales[idx], { toValue: 0.85, duration: 180, delay: 780, easing: easeOut, useNativeDriver: true }),
+            // Blob pops outward on impact, then eases down to the visualizer's rest size
+            // (AIVisualizer's CIRCLE_SIZE is 98px = coreBlob 140px × 0.7, so ending blobScale
+            // at 0.7 means the handoff to the visualizer at chatReady is size-matched and the
+            // user sees a smooth shrink instead of a pop-to-smaller on unmount).
             Animated.sequence([
+                Animated.delay(780),
                 Animated.timing(blobScale, { toValue: 1.2, duration: 200, easing: easeOut, useNativeDriver: true }),
                 Animated.timing(blobScale, { toValue: 0.7, duration: 360, easing: easeInOut, useNativeDriver: true }),
-            ]).start();
-        }, 780);
-        Animated.timing(orbTransY, { toValue: LIFT, duration: 600, delay: 740, easing: easeInOut, useNativeDriver: true }).start();
+            ]),
+            // Lift the whole orb container up
+            Animated.timing(orbTransY, { toValue: LIFT, duration: 600, delay: 740, easing: easeInOut, useNativeDriver: true }),
+        ]).start();
 
         // --- PHASE 5 (880 → 1320ms): header, canvas, bottom bar slide in behind the orb motion ---
         Animated.parallel([
@@ -797,13 +777,8 @@ const VoiceOverlay = ({ userId, visible, onClose }: VoiceOverlayProps) => {
         if (m) {
             barHeightVals.forEach(h => Animated.timing(h, { toValue: 10, duration: 280, useNativeDriver: false }).start());
             barXVals.forEach(x => Animated.timing(x, { toValue: 0, duration: 280, useNativeDriver: false }).start());
-            // barsOpacity must stay JS-driven: barsWrap's children (visBar) have
-            // JS-driven transform translateX from barXVals, and RN's view flattening
-            // collapses those leaf bars into the parent — yielding native opacity +
-            // JS transform on the same node, which throws "JS driven animation on
-            // animated node moved to native earlier". 180ms opacity on JS is fine.
-            Animated.timing(barsOpacity, { toValue: 0, duration: 180, useNativeDriver: false }).start();
             Animated.parallel([
+                Animated.timing(barsOpacity, { toValue: 0, duration: 180, useNativeDriver: true }),
                 Animated.timing(micBtnWidth, { toValue: 76, duration: 240, easing: Easing.out(Easing.cubic), useNativeDriver: false }),
                 Animated.timing(micBtnHeight, { toValue: 76, duration: 240, easing: Easing.out(Easing.cubic), useNativeDriver: false }),
                 Animated.timing(micBtnRadius, { toValue: 38, duration: 240, easing: Easing.out(Easing.cubic), useNativeDriver: false }),
@@ -1307,8 +1282,8 @@ ${combosCatalogForPrompt()}
                     ? getComboInstructions(activeCombo)
                     : getInitialInstructions();
                 const greeting = activeCombo
-                    ? `ابدأ ردك بالضبط بعبارة "هلا يا قلبي" ثم اسأله على طول عن ${activeCombo.groups.find((g) => g.required)?.title_ar || 'الحجم'}. جملة واحدة قصيرة.`
-                    : `ابدأ ردك بالضبط بعبارة "هلا يا قلبي" ثم عرّف عن نفسك إنك "جاهز AI" واسأله وش يشتهي اليوم — برقر، دجاج، شاورما، بيتزا، أو قهوة؟ جملتين فقط لا تطوّل. لا تذكر أسماء مطاعم.`;
+                    ? `رحّب بالمستخدم كلمتين فقط ("هلا!" أو "أبشر!") ثم اسأله على طول عن ${activeCombo.groups.find((g) => g.required)?.title_ar || 'الحجم'}. جملة واحدة قصيرة.`
+                    : `رحّب بالمستخدم ترحيب حار وقصير وعرّف عن نفسك إنك "جاهز AI" واسأله وش يشتهي اليوم — برقر، دجاج، شاورما، بيتزا، أو قهوة؟ جملتين فقط لا تطوّل. لا تذكر أسماء مطاعم.`;
 
                 // Initialize Session
                 const sessionUpdate = {
@@ -1500,32 +1475,8 @@ ${combosCatalogForPrompt()}
         // log never goes blank. We fire-and-forget because the Gemini connect
         // below shouldn't block on the ASR socket being ready.
         if (!transcribeWs.current) {
-            // Accumulate partials so the cuisine detector sees the full
-            // utterance-so-far each tick, not just one delta.
-            let partialAcc = '';
             openTranscribeSession(authToken, {
-                onPartial: (delta) => {
-                    // Drop partials that arrive while the AI is speaking or
-                    // within the echo-tail window. The mic picks up speaker
-                    // output and gpt-4o-transcribe — when the audio is unclear
-                    // — invents plausible Arabic instead of transcribing,
-                    // including meta-text like "this is a Saudi Arabic
-                    // conversation about ordering food". Those false partials
-                    // were also tripping the fast cuisine intent detector.
-                    if (isSpeaking.current || echoTailTimerRef.current) return;
-                    partialAcc += delta;
-                    tryFastCuisineFromTranscript(partialAcc);
-                },
                 onFinal: (text) => {
-                    // Reset the partial buffer at the end of each utterance so
-                    // the next turn starts clean. Also re-arm the fast cuisine
-                    // path here so the OpenAI flow (which has no Gemini
-                    // turnComplete) still gets per-utterance reset.
-                    partialAcc = '';
-                    fastSuggestFiredRef.current = false;
-                    // Same echo-suppression as onPartial — don't push hallucinated
-                    // transcripts into the chat as fake user messages.
-                    if (isSpeaking.current || echoTailTimerRef.current) return;
                     // Primary caption source for the chat log. Gemini's own
                     // inputTranscription is suppressed when this socket is alive.
                     //
@@ -1680,27 +1631,19 @@ ${combosCatalogForPrompt()}
             }
 
             const accessToken = data?.access_token;
-            const rawKey = data?.raw_key;
-            if (!accessToken && !rawKey) {
-                // Log just the keys present, never the values — `data` may
-                // include `raw_key` and dumping the whole object leaks it.
-                console.error("No access_token or raw_key in response. keys:", Object.keys(data || {}));
-                throw new Error('No Gemini auth credential returned');
+            if (!accessToken) {
+                console.error("No access_token in data:", data);
+                throw new Error('No Gemini access token returned');
             }
 
             console.log('Got Gemini token, connecting to Gemini Live...');
+            console.log('[GEMINI] token prefix:', accessToken.slice(0, 20) + '...');
 
-            // DIAGNOSTIC (3.1 swap): switched to v1beta unconstrained
-            // BidiGenerateContent with raw API key — the v1alpha Constrained
-            // endpoint closes 3.1 sessions with WS 1008 right after the first
-            // serverContent frame. Once 3.1 is confirmed working, swap back to
-            // a proper proxy so the key doesn't ship to clients.
-            const url = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${encodeURIComponent(rawKey)}`;
-            // Mask BOTH `key=` and `access_token=` query params so the raw
-            // credential never lands in dev logs (was previously printed in
-            // plaintext because the regex only matched access_token=).
-            const maskedUrl = url.replace(/(\?|&)(key|access_token)=[^&]+/g, '$1$2=***');
-            console.log('[GEMINI] WS url:', maskedUrl);
+            // v1alpha Constrained endpoint for ephemeral-token auth. The token was
+            // minted server-side with the model locked to 3.1-flash-live-preview,
+            // so a leaked client token can't be re-pointed at a more expensive model.
+            const url = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContentConstrained?access_token=${encodeURIComponent(accessToken)}`;
+            console.log('[GEMINI] WS url (masked):', url.replace(/access_token=[^&]+/, 'access_token=***'));
 
             // @ts-ignore
             const socket = new WebSocket(url);
@@ -1738,8 +1681,8 @@ ${combosCatalogForPrompt()}
                     ? getComboInstructions(activeCombo)
                     : getInitialInstructions();
                 const greeting = activeCombo
-                    ? `ابدأ ردك بالضبط بعبارة "هلا يا قلبي" ثم اسأله على طول عن ${activeCombo.groups.find((g) => g.required)?.title_ar || 'الحجم'}. جملة واحدة قصيرة.`
-                    : `ابدأ ردك بالضبط بعبارة "هلا يا قلبي" ثم عرّف عن نفسك إنك "جاهز AI" واسأله وش يشتهي اليوم — برقر، دجاج، شاورما، بيتزا، أو قهوة؟ جملتين فقط لا تطوّل. لا تذكر أسماء مطاعم.`;
+                    ? `رحّب بالمستخدم كلمتين فقط ("هلا!" أو "أبشر!") ثم اسأله على طول عن ${activeCombo.groups.find((g) => g.required)?.title_ar || 'الحجم'}. جملة واحدة قصيرة.`
+                    : `رحّب بالمستخدم ترحيب حار وقصير وعرّف عن نفسك إنك "جاهز AI" واسأله وش يشتهي اليوم — برقر، دجاج، شاورما، بيتزا، أو قهوة؟ جملتين فقط لا تطوّل. لا تذكر أسماء مطاعم.`;
 
                 // Setup message — locks audio modality, enables transcription both ways,
                 // tunes VAD to match OpenAI's server_vad thresholds for consistent barge-in feel.
@@ -1748,19 +1691,26 @@ ${combosCatalogForPrompt()}
                 // on the client's subsequent setup frame.
                 const setupMsg = {
                     setup: {
-                        // Gemini 3.1 Flash Live Preview. Forum reports indicate the
-                        // 1011 "Resource exhausted" failure that hit the previous
-                        // 3.1 attempt was a 2.5-class infra bug largely fixed in 3.1.
-                        // Watch list for this model: ~10-min session disconnects,
-                        // 5G↔4G handoff lockups, occasional tool-call drift after
-                        // long history. Fall back to 2.5 GA if these block ordering.
-                        model: 'models/gemini-3.1-flash-live-preview',
+                        // Switched from gemini-3.1-flash-live-preview — it accepted setup
+                        // + greeting + audio but produced NO serverContent frames (only
+                        // sessionResumptionUpdate heartbeats) and eventually closed with
+                        // 1011 "Resource has been exhausted". Strong indication that 3.1
+                        // preview isn't generally available for our project tier.
+                        // The 2.5-native-audio preview is broadly accessible and supports
+                        // transcription + function tools.
+                        model: 'models/gemini-2.5-flash-native-audio-preview-12-2025',
                         generationConfig: {
                             responseModalities: ['AUDIO'],
                             speechConfig: {
                                 voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } },
                                 languageCode: 'ar-EG',
                             },
+                            // Disable thinking. On 2.5 native-audio, the default thinking
+                            // budget makes the model emit internal-reasoning text parts
+                            // ("**Crafting The Welcome**...") for 1–2s before any audio
+                            // tokens stream. thinkingBudget=0 skips that phase entirely —
+                            // response audio starts almost immediately after turnComplete.
+                            thinkingConfig: { thinkingBudget: 0 },
                         },
                         // Shorten end-of-turn silence detection. The default auto-VAD
                         // waits ~1000ms of silence before committing the user turn; 400ms
@@ -1773,6 +1723,10 @@ ${combosCatalogForPrompt()}
                         },
                         systemInstruction: { parts: [{ text: instructions }] },
                         tools: [{ functionDeclarations }],
+                        // Transcription both ways — parity with the OpenAI path.
+                        // Empty objects are the "enable with defaults" signal on 2.5
+                        // native-audio. Server emits serverContent.inputTranscription
+                        // and serverContent.outputTranscription deltas during the turn.
                         inputAudioTranscription: {},
                         outputAudioTranscription: {},
                     },
@@ -1849,10 +1803,6 @@ ${combosCatalogForPrompt()}
                         if (sc.interrupted) {
                             console.log('[GEMINI] Server-detected user interrupt');
                             aiResponseInterruptedRef.current = true;
-                            // User started a new turn by talking over the AI —
-                            // re-arm the fast cuisine path so the new utterance
-                            // can fire it.
-                            fastSuggestFiredRef.current = false;
                             audioBuffer.current = '';
                             // Drop any throttled caption flush — caption is about
                             // to be cleared, we don't want it flashing back in.
@@ -1863,8 +1813,7 @@ ${combosCatalogForPrompt()}
                             // Clear any streaming-playback state so the recursive
                             // didJustFinish chain exits instead of continuing to
                             // drain buffered audio that the user just talked over.
-                            streamingPendingRef.current = [];
-                            streamingPendingBytesRef.current = 0;
+                            streamingPendingRef.current = '';
                             streamingTurnEndedRef.current = false;
                             streamingBusyRef.current = false;
                             firstKickPendingRef.current = false;
@@ -1886,14 +1835,8 @@ ${combosCatalogForPrompt()}
                         }
 
                         // Incremental ASR of user speech — accumulate until turnComplete.
-                        // Also feed the live transcript into the fast cuisine
-                        // detector so cards can appear before the user even
-                        // finishes the sentence. Drop deltas that arrive while
-                        // the AI is speaking or in the echo-tail window — those
-                        // are echo of speaker output, not the user.
-                        if (sc.inputTranscription?.text && !isSpeaking.current && !echoTailTimerRef.current) {
+                        if (sc.inputTranscription?.text) {
                             geminiInputTranscript += sc.inputTranscription.text;
-                            tryFastCuisineFromTranscript(geminiInputTranscript);
                         }
 
                         // Incremental text of AI's spoken output — drive the live caption.
@@ -1957,8 +1900,7 @@ ${combosCatalogForPrompt()}
                                         }
                                     }
                                     audioBuffer.current += part.inlineData.data;
-                                    streamingPendingRef.current.push(part.inlineData.data);
-                                    streamingPendingBytesRef.current += part.inlineData.data.length;
+                                    streamingPendingRef.current += part.inlineData.data;
                                     // Start playback as soon as first batch threshold is
                                     // met. Subsequent chunks are picked up automatically
                                     // by the recursive playPendingStreamAudio chain.
@@ -1973,7 +1915,7 @@ ${combosCatalogForPrompt()}
                                     // kicks stay synchronous so mid-turn chunks don't gap.
                                     if (!streamingBusyRef.current
                                         && !firstKickPendingRef.current
-                                        && streamingPendingBytesRef.current >= STREAM_FIRST_BATCH_MIN_B64) {
+                                        && streamingPendingRef.current.length >= STREAM_FIRST_BATCH_MIN_B64) {
                                         firstKickPendingRef.current = true;
                                         setTimeout(() => {
                                             firstKickPendingRef.current = false;
@@ -1986,7 +1928,7 @@ ${combosCatalogForPrompt()}
 
                         // End of model turn — commit transcripts and play buffered audio.
                         if (sc.turnComplete) {
-                            console.log(`[GEMINI] turnComplete t=${Date.now()} bufLen=${audioBuffer.current.length} pendChunks=${streamingPendingRef.current.length} pendBytes=${streamingPendingBytesRef.current} busy=${streamingBusyRef.current}`);
+                            console.log(`[GEMINI] turnComplete t=${Date.now()} bufLen=${audioBuffer.current.length} pendLen=${streamingPendingRef.current.length} busy=${streamingBusyRef.current}`);
 
                             // Cancel any pending throttled caption flush — the
                             // geminiOutputTranscript is about to be committed to
@@ -2022,8 +1964,7 @@ ${combosCatalogForPrompt()}
                             if (aiResponseInterruptedRef.current) {
                                 // Interrupted mid-turn — drop everything, don't play.
                                 audioBuffer.current = '';
-                                streamingPendingRef.current = [];
-                                streamingPendingBytesRef.current = 0;
+                                streamingPendingRef.current = '';
                                 streamingTurnEndedRef.current = false;
                             } else {
                                 // Tell the streaming pipeline no more chunks are coming.
@@ -2043,8 +1984,6 @@ ${combosCatalogForPrompt()}
                             // leaves the flag stuck true and every subsequent AI turn
                             // gets its audio dropped at the gate below.
                             aiResponseInterruptedRef.current = false;
-                            // Re-arm the fast cuisine path for the next user turn.
-                            fastSuggestFiredRef.current = false;
                         }
                     }
 
@@ -2132,8 +2071,7 @@ ${combosCatalogForPrompt()}
     };
 
     // Handle select_restaurant tool call — instant since menus are pre-loaded
-    const handleSelectRestaurant = (restaurantName: string, socket: WebSocket, opts?: { clearCards?: boolean }) => {
-        const clearCards = opts?.clearCards !== false;
+    const handleSelectRestaurant = (restaurantName: string, socket: WebSocket) => {
         console.log(`[TOOL] select_restaurant: "${restaurantName}"`);
 
         // Fuzzy match restaurant name — generic matching for all restaurants
@@ -2185,46 +2123,33 @@ ${combosCatalogForPrompt()}
             };
         }
 
-        // Idempotent re-entry guard: when a tap already fired this handler
-        // locally for instant logo appearance, the AI's later select_restaurant
-        // tool call lands here a second time — same restaurant, no UI change
-        // needed and we must NOT replay the spring (it would yank the logo
-        // back to scale 0 and pop again, looking like a glitch).
-        const alreadySelected = selectedRestaurantRef.current?.id === restaurant.id;
-
         selectedRestaurantRef.current = restaurant;
         setActiveRestaurantUI(restaurant);
-        if (clearCards) setSuggestedRestaurants([]);
+        setSuggestedRestaurants([]);
 
-        if (!alreadySelected) {
-            // Elegant spring entrance for the newly selected restaurant logo
-            selectedRestAnimScale.setValue(0);
-            Animated.spring(selectedRestAnimScale, {
-                toValue: 1,
-                tension: 50,
-                friction: 6,
-                useNativeDriver: true
-            }).start();
-        }
+        // Elegant spring entrance for the newly selected restaurant logo
+        selectedRestAnimScale.setValue(0);
+        Animated.spring(selectedRestAnimScale, {
+            toValue: 1,
+            tension: 50,
+            friction: 6,
+            useNativeDriver: true
+        }).start();
 
         // Build the validation index for this restaurant's menu so every
         // subsequent update_cart call can snap AI-supplied items to canonical
-        // names + prices (see validateCartItems in handleUpdateCart). Skip on
-        // the duplicate (tap-then-tool-call) entry — same menu_json builds
-        // an identical index.
-        if (!alreadySelected) {
-            menuIndexRef.current = buildMenuIndex(restaurant.menu_json);
+        // names + prices (see validateCartItems in handleUpdateCart).
+        menuIndexRef.current = buildMenuIndex(restaurant.menu_json);
 
-            // Inject the full menu into the AI's instructions — protocol helper
-            // handles OpenAI session.update vs Gemini clientContent injection.
-            // NOTE on Gemini native-audio: clientContent injection is unreliable —
-            // the model treats it as stray text rather than authoritative context,
-            // which was causing menu/price hallucinations (see tool response below
-            // for the real fix). We still fire this for OpenAI parity and as a
-            // best-effort secondary channel on Gemini.
-            const updatedInstructions = getMenuInstructions(restaurant);
-            sendSessionInstructions(socket, updatedInstructions);
-        }
+        // Inject the full menu into the AI's instructions — protocol helper
+        // handles OpenAI session.update vs Gemini clientContent injection.
+        // NOTE on Gemini native-audio: clientContent injection is unreliable —
+        // the model treats it as stray text rather than authoritative context,
+        // which was causing menu/price hallucinations (see tool response below
+        // for the real fix). We still fire this for OpenAI parity and as a
+        // best-effort secondary channel on Gemini.
+        const updatedInstructions = getMenuInstructions(restaurant);
+        sendSessionInstructions(socket, updatedInstructions);
 
         console.log(`[TOOL] Restaurant selected: ${restaurant.name_en}, menu injected with ${restaurant.menu_json.length} categories, index has ${menuIndexRef.current.items.length} items`);
 
@@ -2503,25 +2428,6 @@ ${combosCatalogForPrompt()}
     };
 
     // Handle suggest_restaurants — shows restaurant cards in chat
-    // Client-side fast-path runner — scans live ASR partials for a cuisine
-    // keyword and fires handleSuggestRestaurants the moment one matches.
-    // This bypasses the AI roundtrip (~1-2s for the suggest_restaurants tool
-    // call) so cards appear in <300ms after the user says "ابي برجر/بيتزا/…".
-    // The AI's later tool call lands as a no-op once cards are already shown,
-    // because handleSuggestRestaurants overwrites with the same matched list.
-    const tryFastCuisineFromTranscript = (transcript: string) => {
-        if (fastSuggestFiredRef.current) return;
-        // Don't preempt the AI when user is past the picker — they may be
-        // ordering inside a chosen restaurant or customizing a combo.
-        if (selectedRestaurantRef.current) return;
-        if (comboStore.getState().activeCombo) return;
-        const matched = detectCuisineIntent(transcript);
-        if (!matched) return;
-        fastSuggestFiredRef.current = true;
-        console.log(`[FAST] cuisine intent matched "${matched}" from partial: "${transcript}"`);
-        handleSuggestRestaurants(matched);
-    };
-
     const handleSuggestRestaurants = (cuisine: string) => {
         console.log(`[TOOL] suggest_restaurants: "${cuisine}"`);
         const matchingNames: string[] = [];
@@ -2549,22 +2455,9 @@ ${combosCatalogForPrompt()}
     // Handle restaurant card tap from suggestions
     const handleRestaurantCardTap = (restaurantNameAr: string) => {
         console.log(`[TAP] Restaurant card tapped: "${restaurantNameAr}"`);
+        setSuggestedRestaurants([]);
         setMessages(prev => [...prev, { role: 'user', text: `اخترت ${restaurantNameAr}` }]);
         if (ws.current && ws.current.readyState === WebSocket.OPEN) {
-            // Fire the local UI flip on the same frame as the tap so the logo
-            // spring kicks in <500ms — without this, the logo waits for the AI
-            // roundtrip (~1-2s) before select_restaurant comes back as a tool
-            // call. The AI still gets the injected text below to keep its
-            // dialogue state in sync; when its select_restaurant tool call
-            // lands, handleSelectRestaurant's idempotent guard makes the
-            // second invocation a no-op for the spring.
-            //
-            // clearCards: false keeps the suggestion cards mounted so the
-            // tapped card's selection celebration (glow + check pop + ring,
-            // ~600 ms) finishes playing before they unmount. The 700 ms timer
-            // below clears them after the celebration completes.
-            handleSelectRestaurant(restaurantNameAr, ws.current, { clearCards: false });
-            setTimeout(() => setSuggestedRestaurants([]), 700);
             sendInjectedUserText(ws.current, `اخترت ${restaurantNameAr}`);
         }
     };
@@ -2576,8 +2469,7 @@ ${combosCatalogForPrompt()}
     const playPendingStreamAudio = async () => {
         if (streamingBusyRef.current) return;
         if (aiResponseInterruptedRef.current) {
-            streamingPendingRef.current = [];
-            streamingPendingBytesRef.current = 0;
+            streamingPendingRef.current = '';
             return;
         }
         if (streamingPendingRef.current.length === 0) {
@@ -2599,25 +2491,8 @@ ${combosCatalogForPrompt()}
             return;
         }
 
-        // Subsequent-batch min-drain. While the turn is still ongoing, wait
-        // for at least ~100ms of audio before spawning a new Sound — without
-        // this, 3.1's tiny chunks (1-10 tokens per frame) cause one
-        // Audio.Sound spawn per 30ms of audio, which is the audible stutter.
-        // Skip the wait when the turn has ended (drain everything) or when
-        // we haven't started playing yet (let the first-batch threshold gate that).
-        if (streamingBusyRef.current === false
-            && !streamingTurnEndedRef.current
-            && audioBuffer.current.length > 0  // we've already started this turn
-            && streamingPendingBytesRef.current < STREAM_SUBSEQUENT_MIN_B64) {
-            // Re-arm a check shortly — by then more chunks should have arrived
-            // or the turn will have ended.
-            setTimeout(() => { playPendingStreamAudio(); }, 80);
-            return;
-        }
-
         const batch = streamingPendingRef.current;
-        streamingPendingRef.current = [];
-        streamingPendingBytesRef.current = 0;
+        streamingPendingRef.current = '';
         streamingBusyRef.current = true;
 
         // Hard guarantee: only ONE sound object is alive at a time. If a
@@ -2655,7 +2530,7 @@ ${combosCatalogForPrompt()}
         const uri = (FileSystem.cacheDirectory || FileSystem.documentDirectory || '')
             + `stream_${Date.now()}_${Math.random().toString(36).slice(2, 7)}.wav`;
         try {
-            const wavData = appendWavHeaderFromChunks(batch);
+            const wavData = appendWavHeader(batch);
             await FileSystem.writeAsStringAsync(uri, wavData, { encoding: FileSystem.EncodingType.Base64 });
             if (aiResponseInterruptedRef.current) { streamingBusyRef.current = false; return; }
 
@@ -2682,7 +2557,7 @@ ${combosCatalogForPrompt()}
                         playbackPositionMsRef.current = status.positionMillis;
                     }
                     if (status.didJustFinish) {
-                        console.log(`[BATCH] didJustFinish t=${Date.now()} pendChunks=${streamingPendingRef.current.length} pendBytes=${streamingPendingBytesRef.current} turnEnded=${streamingTurnEndedRef.current}`);
+                        console.log(`[BATCH] didJustFinish t=${Date.now()} pendLen=${streamingPendingRef.current.length} turnEnded=${streamingTurnEndedRef.current}`);
                         playbackPositionMsRef.current = 0;
                         try { newSound!.unloadAsync(); } catch {}
                         FileSystem.deleteAsync(uri, { idempotent: true }).catch(() => {});
@@ -2715,18 +2590,6 @@ ${combosCatalogForPrompt()}
             }
             // The WAV may have been written before the failure — delete unconditionally.
             FileSystem.deleteAsync(uri, { idempotent: true }).catch(() => {});
-            // Restore the consumed batch back to the pending queue, otherwise
-            // the 120ms retry sees an empty queue and exits — that's the bug
-            // where the FIRST greeting's transcript shows but no audio plays.
-            // Order matters: batch was the head of the queue, so unshift it
-            // back in front of any chunks that arrived during the failed try.
-            // Skip if interrupted in the meantime — those chunks should drop.
-            if (!aiResponseInterruptedRef.current) {
-                streamingPendingRef.current = batch.concat(streamingPendingRef.current);
-                let restoredBytes = 0;
-                for (let i = 0; i < batch.length; i++) restoredBytes += batch[i].length;
-                streamingPendingBytesRef.current += restoredBytes;
-            }
             streamingBusyRef.current = false;
             // Defer the drain retry. A synchronous retry after AudioFocus
             // failure just fails the same way and risks stacking playbacks
@@ -2907,14 +2770,7 @@ ${combosCatalogForPrompt()}
                 // Raw 24 kHz PCM16 (no resample) — OpenAI's native input rate, so
                 // the caption-critical path sees pristine audio. No-op if the
                 // socket isn't open; Gemini fallback covers that case.
-                //
-                // Skip while the AI is speaking (or in the echo-tail window):
-                // gpt-4o-transcribe will hallucinate plausible Arabic when fed
-                // unclear audio (echo of speaker output), producing fake user
-                // messages like "this is a Saudi Arabic conversation about
-                // food ordering". The main socket still gets the audio so
-                // barge-in / server VAD can detect a real interruption.
-                if (transcribeWs.current && !isSpeaking.current && !echoTailTimerRef.current) {
+                if (transcribeWs.current) {
                     sendTranscribeChunk(transcribeWs.current, data);
                 }
             });
