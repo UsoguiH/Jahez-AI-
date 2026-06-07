@@ -22,7 +22,7 @@ places the order — hands-free, end to end.
 
 <div align="center">
 
-<a href="https://github.com/UsoguiH/Jahez-AI-/raw/jahez-3.1-test/docs/demo.mp4">
+<a href="https://github.com/UsoguiH/Jahez-AI-/blob/jahez-3.1-test/docs/demo.mp4">
   <img src="docs/demo-thumb.jpg" alt="▶ Watch the demo" width="720">
 </a>
 
