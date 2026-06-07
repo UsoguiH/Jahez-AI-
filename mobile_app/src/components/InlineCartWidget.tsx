@@ -3,6 +3,7 @@ import { View, Text, TouchableOpacity, Animated, Image } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { CartItem } from './OrderCartWidget';
 import { getRestaurantLogo } from '../lib/restaurantLogos';
+import { getFoodImageSource } from '../lib/menuItemImages';
 
 interface InlineCartWidgetProps {
     items: CartItem[];
@@ -13,31 +14,6 @@ interface InlineCartWidgetProps {
 
 const VAT_RATE = 0.15;
 const MAX_VISIBLE_ITEMS = 3;
-
-const getFoodImage = (nameEn: string): string => {
-    const n = nameEn.toLowerCase();
-    if (n.includes('burger') || n.includes('mac') || n.includes('big mac') || n.includes('crispy'))
-        return 'https://images.unsplash.com/photo-1568901346375-23c9450c58cd?w=200&h=200&fit=crop';
-    if (n.includes('chicken') || n.includes('nugget') || n.includes('mcnugget'))
-        return 'https://images.unsplash.com/photo-1626082927389-6cd097cdc6ec?w=200&h=200&fit=crop';
-    if (n.includes('fries') || n.includes('fry'))
-        return 'https://images.unsplash.com/photo-1573080496219-bb080dd4f877?w=200&h=200&fit=crop';
-    if (n.includes('drink') || n.includes('cola') || n.includes('pepsi') || n.includes('sprite'))
-        return 'https://images.unsplash.com/photo-1625772299848-391b6a87d7b3?w=200&h=200&fit=crop';
-    if (n.includes('wrap') || n.includes('shawarma'))
-        return 'https://images.unsplash.com/photo-1626700051175-6818013e1d4f?w=200&h=200&fit=crop';
-    if (n.includes('pizza'))
-        return 'https://images.unsplash.com/photo-1565299624946-b28f40a0ae38?w=200&h=200&fit=crop';
-    if (n.includes('coffee') || n.includes('latte') || n.includes('cappuccino'))
-        return 'https://images.unsplash.com/photo-1541167760496-9af0ab7f0da7?w=200&h=200&fit=crop';
-    if (n.includes('ice cream') || n.includes('sundae') || n.includes('mcflurry'))
-        return 'https://images.unsplash.com/photo-1563805042-7684c019e1cb?w=200&h=200&fit=crop';
-    if (n.includes('salad'))
-        return 'https://images.unsplash.com/photo-1512621776951-a57141f2eefd?w=200&h=200&fit=crop';
-    if (n.includes('meal') || n.includes('combo'))
-        return 'https://images.unsplash.com/photo-1594212699903-ec8a3eca50f5?w=200&h=200&fit=crop';
-    return 'https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=200&h=200&fit=crop';
-};
 
 // Compact item row — RTL: image leads on the right, stepper on the left.
 const CartRow: React.FC<{
@@ -120,7 +96,7 @@ const CartRow: React.FC<{
 
                 {/* Image (RIGHT — leading edge in RTL) */}
                 <Image
-                    source={{ uri: getFoodImage(item.name_en) }}
+                    source={getFoodImageSource(item)}
                     style={{
                         width: 44,
                         height: 44,
@@ -146,7 +122,7 @@ const StackedThumbs: React.FC<{ items: CartItem[] }> = ({ items }) => {
             {shown.map((it, i) => (
                 <Image
                     key={`${it.name_en}-${i}`}
-                    source={{ uri: getFoodImage(it.name_en) }}
+                    source={getFoodImageSource(it)}
                     style={{
                         width: 32,
                         height: 32,

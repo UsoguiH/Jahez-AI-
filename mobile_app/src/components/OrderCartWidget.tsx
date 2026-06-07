@@ -2,6 +2,7 @@ import React, { useEffect, useRef } from 'react';
 import { View, Text, TouchableOpacity, Animated, ScrollView, Image, StyleSheet, Dimensions } from 'react-native';
 import { MaterialIcons, Ionicons } from '@expo/vector-icons';
 import { getRestaurantLogo } from '../lib/restaurantLogos';
+import { getFoodImageSource } from '../lib/menuItemImages';
 
 export interface CartItem {
     name_ar: string;
@@ -28,31 +29,6 @@ interface OrderCartWidgetProps {
 
 const VAT_RATE = 0.15;
 
-// Food image mapping based on item name
-const getFoodImage = (nameEn: string): string => {
-    const lower = nameEn.toLowerCase();
-    if (lower.includes('burger') || lower.includes('crispy') || lower.includes('deluxe') || lower.includes('mac') || lower.includes('big'))
-        return 'https://images.unsplash.com/photo-1568901346375-23c9450c58cd?auto=format&fit=crop&w=140&h=140&q=80';
-    if (lower.includes('tasty') || lower.includes('tasti'))
-        return 'https://images.unsplash.com/photo-1551782450-a2132b4ba21d?auto=format&fit=crop&w=140&h=140&q=80';
-    if (lower.includes('chicken') || lower.includes('nugget') || lower.includes('broast') || lower.includes('spicy') || lower.includes('grand'))
-        return 'https://images.unsplash.com/photo-1626082927389-6cd097cdc6ec?auto=format&fit=crop&w=140&h=140&q=80';
-    if (lower.includes('fries') || lower.includes('potato'))
-        return 'https://images.unsplash.com/photo-1573080496219-bb080dd4f877?auto=format&fit=crop&w=140&h=140&q=80';
-    if (lower.includes('pizza'))
-        return 'https://images.unsplash.com/photo-1565299624946-b28f40a0ae38?auto=format&fit=crop&w=140&h=140&q=80';
-    if (lower.includes('drink') || lower.includes('cola') || lower.includes('pepsi') || lower.includes('juice'))
-        return 'https://images.unsplash.com/photo-1561758033-d89a9ad46330?auto=format&fit=crop&w=140&h=140&q=80';
-    if (lower.includes('sundae') || lower.includes('mcflurry') || lower.includes('ice'))
-        return 'https://images.unsplash.com/photo-1563805042-7684c019e1cb?auto=format&fit=crop&w=140&h=140&q=80';
-    if (lower.includes('wrap') || lower.includes('tortilla') || lower.includes('shawarma'))
-        return 'https://images.unsplash.com/photo-1626700051175-6818013e1d4f?auto=format&fit=crop&w=140&h=140&q=80';
-    if (lower.includes('salad'))
-        return 'https://images.unsplash.com/photo-1512621776951-a57141f2eefd?auto=format&fit=crop&w=140&h=140&q=80';
-    if (lower.includes('coffee') || lower.includes('latte'))
-        return 'https://images.unsplash.com/photo-1509042239860-f550ce710b93?auto=format&fit=crop&w=140&h=140&q=80';
-    return 'https://images.unsplash.com/photo-1546069901-ba9599a7e63c?auto=format&fit=crop&w=140&h=140&q=80';
-};
 
 const { height: SCREEN_HEIGHT } = Dimensions.get('window');
 
@@ -284,7 +260,7 @@ const OrderCartWidget: React.FC<OrderCartWidgetProps> = ({ items, restaurantName
 
                                 {/* Product Image */}
                                 <Image
-                                    source={{ uri: getFoodImage(item.name_en) }}
+                                    source={getFoodImageSource(item)}
                                     style={{
                                         width: 56,
                                         height: 56,

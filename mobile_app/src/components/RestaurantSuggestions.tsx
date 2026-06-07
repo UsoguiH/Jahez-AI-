@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { View, Text, TouchableOpacity, ScrollView, Image, Animated, Easing } from 'react-native';
+import { View, Text, TouchableOpacity, ScrollView, Animated, Easing } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { getRestaurantLogo } from '../lib/restaurantLogos';
 
@@ -31,6 +31,16 @@ export const RESTAURANT_META: Record<string, { cuisine_ar: string; rating: strin
     'الرومانسية': { cuisine_ar: 'أكل سعودي • كبسة • مندي', rating: '4.6', deliveryTime: '30-45 دقيقة', heroImage: 'https://images.unsplash.com/photo-1642821373181-12ea0e0d3d14?w=400&h=250&fit=crop' },
 };
 
+// Delivery fee per restaurant. McDonald's is always free; the rest are split
+// ~half free / half 9 SAR via a stable hash of the name so the value doesn't
+// flicker between re-renders.
+export const getDeliveryFee = (nameAr: string): { label: string; free: boolean } => {
+    if (nameAr.includes('ماكدونالد')) return { label: 'مجاني', free: true };
+    let h = 0;
+    for (let i = 0; i < nameAr.length; i++) h = (h * 31 + nameAr.charCodeAt(i)) >>> 0;
+    return h % 2 === 0 ? { label: 'مجاني', free: true } : { label: '9 ريال', free: false };
+};
+
 export const CUISINE_MAP: Record<string, string[]> = {
     'برجر': ['ماكدونالدز', 'هرفي'],
     'بيتزا': ['بيتزا هت'],
@@ -54,6 +64,7 @@ const AnimatedCard: React.FC<{
 }> = ({ restaurant, index, selectedName, onSelect }) => {
     const meta = RESTAURANT_META[restaurant.name_ar];
     const logo = getRestaurantLogo(restaurant.name_ar);
+    const fee = getDeliveryFee(restaurant.name_ar);
 
     const isSelected = selectedName === restaurant.name_ar;
     const isOther = selectedName !== null && !isSelected;
@@ -185,28 +196,16 @@ const AnimatedCard: React.FC<{
                     borderColor: borderColor,
                 }}>
                     {/* Hero Image */}
-                    <View style={{ height: 108, backgroundColor: '#FEE2E2', overflow: 'hidden' }}>
-                        {meta?.heroImage ? (
-                            <Image source={{ uri: meta.heroImage }} style={{ width: '100%', height: '100%' }} resizeMode="cover" />
+                    <View style={{ height: 108, backgroundColor: '#F3F4F6', overflow: 'hidden', alignItems: 'center', justifyContent: 'center' }}>
+                        {/* Restaurant logo is the hero (replaces the generic food photo) */}
+                        {logo ? (
+                            <Animated.Image
+                                source={logo}
+                                style={{ width: '100%', height: '100%', transform: [{ scale: logoScale }] }}
+                                resizeMode="cover"
+                            />
                         ) : (
-                            <View style={{ flex: 1, alignItems: 'center', justifyContent: 'center' }}>
-                                <Ionicons name="restaurant" size={36} color="rgba(220,38,38,0.25)" />
-                            </View>
-                        )}
-
-                        <View style={{ position: 'absolute', bottom: 0, left: 0, right: 0, height: 30, backgroundColor: 'rgba(0,0,0,0.08)' }} />
-
-                        {/* Logo */}
-                        {logo && (
-                            <Animated.View style={{
-                                position: 'absolute', top: 8, right: 8, width: 38, height: 38, borderRadius: 19,
-                                backgroundColor: '#fff', borderWidth: 2, borderColor: 'rgba(255,255,255,0.95)',
-                                shadowColor: '#000', shadowOffset: { width: 0, height: 3 }, shadowOpacity: 0.2, shadowRadius: 6, elevation: 5,
-                                overflow: 'hidden', alignItems: 'center', justifyContent: 'center',
-                                transform: [{ scale: logoScale }],
-                            }}>
-                                <Image source={logo} style={{ width: 30, height: 30 }} resizeMode="contain" />
-                            </Animated.View>
+                            <Ionicons name="restaurant" size={40} color="rgba(220,38,38,0.25)" />
                         )}
 
                         {/* Promoted badge */}
@@ -256,6 +255,16 @@ const AnimatedCard: React.FC<{
                         <Text style={{ fontSize: 11, color: '#86868B', marginTop: 2, textAlign: 'right', fontWeight: '500' }} numberOfLines={1}>
                             {meta?.cuisine_ar || 'مطعم'}
                         </Text>
+                        {/* Delivery fee pill */}
+                        <View style={{ flexDirection: 'row', justifyContent: 'flex-end', marginTop: 8 }}>
+                            <View style={{
+                                flexDirection: 'row', alignItems: 'center', gap: 4,
+                                backgroundColor: '#DCFCE7', paddingHorizontal: 8, paddingVertical: 3, borderRadius: 8,
+                            }}>
+                                <Ionicons name="bicycle" size={13} color="#15803d" />
+                                <Text style={{ fontSize: 11, fontWeight: '700', color: '#15803d' }}>{fee.label}</Text>
+                            </View>
+                        </View>
                         <View style={{
                             flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
                             marginTop: 10, paddingTop: 8, borderTopWidth: 0.5, borderTopColor: 'rgba(0,0,0,0.05)',

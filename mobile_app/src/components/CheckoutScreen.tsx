@@ -18,6 +18,7 @@ import {
 } from 'react-native';
 import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
 import { CartItem } from './OrderCartWidget';
+import { getFoodImageSource } from '../lib/menuItemImages';
 
 const { height: SCREEN_HEIGHT } = Dimensions.get('window');
 
@@ -74,25 +75,6 @@ const ADDRESSES: Record<AddressId, AddressDef> = {
 };
 
 // ---------- Food image mapping (copied from OrderCartWidget) ----------
-const getFoodImage = (nameEn: string = ''): string => {
-    const lower = nameEn.toLowerCase();
-    if (lower.includes('burger') || lower.includes('crispy') || lower.includes('deluxe') || lower.includes('mac') || lower.includes('big'))
-        return 'https://images.unsplash.com/photo-1568901346375-23c9450c58cd?auto=format&fit=crop&w=200&h=200&q=80';
-    if (lower.includes('tasty') || lower.includes('tasti'))
-        return 'https://images.unsplash.com/photo-1551782450-a2132b4ba21d?auto=format&fit=crop&w=200&h=200&q=80';
-    if (lower.includes('chicken') || lower.includes('nugget') || lower.includes('broast') || lower.includes('spicy') || lower.includes('grand'))
-        return 'https://images.unsplash.com/photo-1626082927389-6cd097cdc6ec?auto=format&fit=crop&w=200&h=200&q=80';
-    if (lower.includes('fries') || lower.includes('potato'))
-        return 'https://images.unsplash.com/photo-1573080496219-bb080dd4f877?auto=format&fit=crop&w=200&h=200&q=80';
-    if (lower.includes('pizza'))
-        return 'https://images.unsplash.com/photo-1565299624946-b28f40a0ae38?auto=format&fit=crop&w=200&h=200&q=80';
-    if (lower.includes('drink') || lower.includes('cola') || lower.includes('pepsi') || lower.includes('juice'))
-        return 'https://images.unsplash.com/photo-1561758033-d89a9ad46330?auto=format&fit=crop&w=200&h=200&q=80';
-    if (lower.includes('sundae') || lower.includes('mcflurry') || lower.includes('ice'))
-        return 'https://images.unsplash.com/photo-1563805042-7684c019e1cb?auto=format&fit=crop&w=200&h=200&q=80';
-    return 'https://images.unsplash.com/photo-1546069901-ba9599a7e63c?auto=format&fit=crop&w=200&h=200&q=80';
-};
-
 // ---------- Parse "<name> - <modifiers>" into two parts for display ----------
 const splitNameAndMods = (nameAr: string) => {
     const dash = nameAr.indexOf(' - ');
@@ -188,7 +170,7 @@ const CheckoutScreen: React.FC<CheckoutScreenProps> = ({ visible, items, onClose
         return (
             <View style={[styles.productRow, last ? null : styles.productRowDivider]}>
                 {/* Right: food image */}
-                <Image source={{ uri: getFoodImage(item.name_en) }} style={styles.productImage} />
+                <Image source={getFoodImageSource(item)} style={styles.productImage} />
 
                 {/* Center: name + mods + price */}
                 <View style={{ flex: 1, marginHorizontal: 12, alignItems: 'flex-end' }}>
