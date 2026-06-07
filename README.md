@@ -22,10 +22,11 @@ places the order — hands-free, end to end.
 
 <div align="center">
 
-<img src="docs/demo.gif" alt="Jahez AI demo" width="300">
+<a href="https://github.com/UsoguiH/Jahez-AI-/blob/jahez-3.1-test/docs/demo.mp4">
+  <img src="docs/demo-thumb.jpg" alt="▶ Watch the demo" width="640">
+</a>
 
-<em>Speak an order in Arabic → watch the cart build itself → confirm.<br/>
-▶ <a href="https://github.com/UsoguiH/Jahez-AI-/blob/jahez-3.1-test/docs/demo.mp4">Watch the full video</a></em>
+<em>Click to play · Speak an order in Arabic → watch the cart build itself → confirm.</em>
 
 </div>
 
